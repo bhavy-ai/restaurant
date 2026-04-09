@@ -16,6 +16,24 @@ interface NavItem {
   badgeColor?: string;
 }
 
+const navPermissionMap: Record<string, string> = {
+  'pos-billing': 'pos-billing',
+  'kitchen-display-system': 'kitchen-display-system',
+  'table-management': 'table-management',
+  'takeaway': 'takeaway',
+  'aggregator-orders': 'takeaway',
+  'inventory-management': 'inventory-management',
+  'recipe-management': 'recipe-management',
+  'discounts': 'discounts',
+  'customer-management': 'customer-management',
+  'settlement-dashboard': 'settlement-dashboard',
+  'reports': 'reports',
+  'multi-outlet': 'multi-outlet',
+  'menu-sync': 'admin-panel',
+  'admin-panel': 'admin-panel',
+  'restaurant-billing': 'admin-panel',
+};
+
 const navGroups = [
   {
     label: 'OPERATIONS',
@@ -71,7 +89,9 @@ export default function Sidebar({ currentPath, onClose }: SidebarProps) {
   const outletMenuRef = useRef<HTMLDivElement>(null);
 
   const {
+    user,
     staffUser,
+    canAccess,
     signOut,
     activeRestaurant,
     activeOutlet,
@@ -79,29 +99,13 @@ export default function Sidebar({ currentPath, onClose }: SidebarProps) {
     accessibleOutlets,
     switchRestaurant,
     switchOutlet,
+    isSuperadmin: isSuperAdminFromContext,
   } = useAuth();
   const router = useRouter();
 
-  // Check superadmin status
   useEffect(() => {
-    const checkSuperAdmin = async () => {
-      try {
-        const supabase = createClient();
-        const { data: { user } } = await supabase.auth.getUser();
-        if (!user) return;
-        const { data } = await supabase
-          .from('platform_superadmins')
-          .select('id')
-          .eq('user_id', user.id)
-          .eq('is_active', true)
-          .maybeSingle();
-        setIsSuperAdmin(!!data);
-      } catch {
-        setIsSuperAdmin(false);
-      }
-    };
-    checkSuperAdmin();
-  }, []);
+    setIsSuperAdmin(isSuperAdminFromContext);
+  }, [isSuperAdminFromContext]);
 
   // Close dropdowns on outside click
   useEffect(() => {
@@ -290,6 +294,9 @@ export default function Sidebar({ currentPath, onClose }: SidebarProps) {
               {group.items.map((item) => {
                 // Hide superadmin link for non-superadmins
                 if (item.id === 'superadmin' && !isSuperAdmin) return null;
+                // Hide modules when the mapped permission is not granted for this role
+                const requiredPermission = navPermissionMap[item.id];
+                if (requiredPermission && !canAccess(requiredPermission)) return null;
                 const isActive = currentPath === item.path;
                 return (
                   <Link
@@ -352,7 +359,7 @@ export default function Sidebar({ currentPath, onClose }: SidebarProps) {
           </div>
           {!collapsed && (
             <div className="flex-1 min-w-0">
-              <p className="text-xs font-semibold text-foreground truncate">{staffUser?.name ?? 'Guest'}</p>
+              <p className="text-xs font-semibold text-foreground truncate">{staffUser?.name ?? user?.email ?? 'Signed in user'}</p>
               <p className="text-[10px] text-muted-foreground capitalize">{staffUser?.role ?? ''}</p>
             </div>
           )}

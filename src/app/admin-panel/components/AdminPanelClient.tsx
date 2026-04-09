@@ -3,6 +3,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { toast } from 'sonner';
 import { Store, Users, FileText, Printer, Plug, ScrollText, Plus, Edit3, Trash2, CheckCircle, X, AlertTriangle, Utensils, Wifi, WifiOff, Eye, EyeOff, Loader2, Save, MessageSquare, Search, Download, Calendar, Filter, RefreshCw, Shield, TrendingUp } from 'lucide-react';
 import { createClient } from '@/lib/supabase/client';
+import { useAuth } from '@/contexts/AuthContext';
 import { staffService, auditService, menuService, gstService, outletSettingsService, printerService, aggregatorService } from '@/lib/services/restaurantService';
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -140,6 +141,7 @@ const defaultAddUserForm: AddUserForm = { name: '', email: '', phone: '', role: 
 const defaultAddMenuForm: AddMenuForm = { name: '', category: 'Starters', price: '', gstRate: '5', hsnCode: '2106', isVeg: true, available: true };
 
 export default function AdminPanelClient() {
+  const { activeRestaurant } = useAuth();
   const [activeSection, setActiveSection] = useState<AdminSection>('users');
   const [users, setUsers] = useState<UserRole[]>([]);
   const [menuItems, setMenuItems] = useState<MenuItem[]>([]);
@@ -241,16 +243,21 @@ export default function AdminPanelClient() {
 
   // ── Load Users ─────────────────────────────────────────────
   const loadUsers = useCallback(async () => {
+    if (!activeRestaurant?.id) {
+      setUsers([]);
+      setLoadingUsers(false);
+      return;
+    }
     setLoadingUsers(true);
     try {
-      const data = await staffService.getAll('koramangala');
+      const data = await staffService.getAll('koramangala', { restaurantId: activeRestaurant.id });
       setUsers(data as UserRole[]);
     } catch (err: any) {
       toast.error('Failed to load users: ' + err.message);
     } finally {
       setLoadingUsers(false);
     }
-  }, []);
+  }, [activeRestaurant?.id]);
 
   // ── Load Menu ──────────────────────────────────────────────
   const loadMenu = useCallback(async () => {
@@ -529,6 +536,10 @@ export default function AdminPanelClient() {
   }
 
   async function handleAddUser() {
+    if (!activeRestaurant?.id) {
+      toast.error('No active restaurant selected. Please select a restaurant and try again.');
+      return;
+    }
     if (!addUserForm.name.trim() || !addUserForm.email.trim()) {
       toast.error('Name and email are required');
       return;
@@ -558,7 +569,7 @@ export default function AdminPanelClient() {
           phone: addUserForm.phone,
           role: addUserForm.role,
           outlet: addUserForm.outlet,
-        });
+        }, { restaurantId: activeRestaurant.id });
         setUsers((prev) => [...prev, newUser as UserRole]);
         toast.success(`${addUserForm.name} added — credentials sent via SMS`);
         await auditService.log({
@@ -740,7 +751,7 @@ export default function AdminPanelClient() {
     try {
       // Simulate connection check — in production this would call a backend proxy
       await new Promise((resolve) => setTimeout(resolve, 1500));
-      // Treat non-empty key as "connected" for demo; real impl would call partner API
+      // Treat non-empty key as "connected"; real impl would call partner API
       const status: 'connected' | 'error' = agg.apiKey.length > 8 ? 'connected' : 'error';
       await aggregatorService.updateStatus(agg.id, status);
       setAggregators((prev) => prev.map((a) => a.id === agg.id ? { ...a, lastStatus: status, lastCheckedAt: new Date().toISOString() } : a));

@@ -74,6 +74,8 @@ const STATUS_COLORS: Record<string, string> = {
   refunded: 'bg-orange-500/10 text-orange-400 border-orange-500/20',
 };
 
+const supabase = createClient();
+
 const fmt = (n: number) =>
   new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(n);
 
@@ -84,8 +86,6 @@ const fmtDate = (iso: string | null) => {
 };
 
 export default function InvoicesDashboard() {
-  const supabase = createClient();
-
   const [restaurants, setRestaurants] = useState<Restaurant[]>([]);
   const [plans, setPlans] = useState<Plan[]>([]);
   const [loading, setLoading] = useState(true);

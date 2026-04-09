@@ -1,6 +1,6 @@
 'use client';
 
-import { createContext, useContext, useEffect, useState, useCallback } from 'react';
+import { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
 import { createClient } from '@/lib/supabase/client';
 
 // Module-level singleton to prevent multiple client instances
@@ -48,6 +48,8 @@ interface AuthContextValue {
   session: any;
   loading: boolean;
   staffUser: StaffUser | null;
+  isSuperadmin: boolean;
+  superadminId: string | null;
   // Multi-restaurant context
   activeRestaurant: Restaurant | null;
   activeOutlet: Outlet | null;
@@ -93,20 +95,40 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const [session, setSession] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [staffUser, setStaffUser] = useState<StaffUser | null>(null);
+  const [isSuperadmin, setIsSuperadmin] = useState(false);
+  const [superadminId, setSuperadminId] = useState<string | null>(null);
 
   // Multi-restaurant state
   const [activeRestaurant, setActiveRestaurant] = useState<Restaurant | null>(null);
   const [activeOutlet, setActiveOutlet] = useState<Outlet | null>(null);
   const [accessibleRestaurants, setAccessibleRestaurants] = useState<Restaurant[]>([]);
   const [accessibleOutlets, setAccessibleOutlets] = useState<Outlet[]>([]);
+  const bootstrappedSessionIdRef = useRef<string | null>(null);
 
   // ── Load all restaurants accessible to this user ──────────────
-  const loadRestaurants = useCallback(async (userId?: string) => {
+  const loadRestaurants = useCallback(async (userId?: string, isSuperadmin?: boolean) => {
     try {
-      // Try user_restaurant_access first (multi-tenant)
       let restaurants: Restaurant[] = [];
 
-      if (userId) {
+      // Superadmins load ALL restaurants directly
+      if (isSuperadmin) {
+        const { data: allRestaurants } = await supabase
+          .from('restaurants')
+          .select('*')
+          .eq('is_active', true)
+          .order('name');
+        if (allRestaurants) {
+          restaurants = allRestaurants.map((r: any) => ({
+            id: r.id,
+            name: r.name,
+            gstin: r.gstin,
+            fssai: r.fssai,
+            plan: r.plan,
+            isActive: r.is_active,
+          }));
+        }
+      } else if (userId) {
+        // Regular users: try user_restaurant_access first (multi-tenant)
         const { data: access } = await supabase
           .from('user_restaurant_access')
           .select('restaurant_id, restaurants(*)')
@@ -126,24 +148,24 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
               isActive: r.is_active,
             }));
         }
-      }
 
-      // Fallback: load all restaurants (for demo / owner without access rows)
-      if (restaurants.length === 0) {
-        const { data: allRestaurants } = await supabase
-          .from('restaurants')
-          .select('*')
-          .eq('is_active', true)
-          .order('name');
-        if (allRestaurants) {
-          restaurants = allRestaurants.map((r: any) => ({
-            id: r.id,
-            name: r.name,
-            gstin: r.gstin,
-            fssai: r.fssai,
-            plan: r.plan,
-            isActive: r.is_active,
-          }));
+        // Fallback: load all restaurants for authenticated users without access rows
+        if (restaurants.length === 0) {
+          const { data: allRestaurants } = await supabase
+            .from('restaurants')
+            .select('*')
+            .eq('is_active', true)
+            .order('name');
+          if (allRestaurants) {
+            restaurants = allRestaurants.map((r: any) => ({
+              id: r.id,
+              name: r.name,
+              gstin: r.gstin,
+              fssai: r.fssai,
+              plan: r.plan,
+              isActive: r.is_active,
+            }));
+          }
         }
       }
 
@@ -187,32 +209,46 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
         .select('*')
         .eq('email', email)
         .eq('status', 'active')
-        .single();
+        .maybeSingle();
       if (data) {
+        const staff = data as any;
         setStaffUser({
-          id: data.id,
-          name: data.name,
-          email: data.email,
-          role: data.role,
-          outlet: data.outlet,
-          permissions: data.permissions || ROLE_PERMISSIONS[data.role] || [],
+          id: staff.id,
+          name: staff.name,
+          email: staff.email,
+          role: staff.role,
+          outlet: staff.outlet,
+          permissions: staff.permissions || ROLE_PERMISSIONS[staff.role] || [],
         });
+      } else {
+        setStaffUser(null);
       }
     } catch {
-      setStaffUser({
-        id: 'demo',
-        name: email?.split('@')[0] || 'User',
-        email: email || '',
-        role: 'owner',
-        outlet: 'koramangala',
-        permissions: ROLE_PERMISSIONS['owner'],
-      });
+      setStaffUser(null);
+    }
+  }
+
+  async function checkAndLoadSuperadmin(userId?: string): Promise<{ isSuperadmin: boolean; superadminId: string | null }> {
+    if (!userId) return { isSuperadmin: false, superadminId: null };
+    try {
+      const { data, error } = await supabase
+        .from('platform_superadmins')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('is_active', true)
+        .maybeSingle();
+      if (!error && data) {
+        return { isSuperadmin: true, superadminId: (data as any).id };
+      }
+      return { isSuperadmin: false, superadminId: null };
+    } catch {
+      return { isSuperadmin: false, superadminId: null };
     }
   }
 
   // ── Bootstrap restaurant + outlet context ─────────────────────
-  const bootstrapContext = useCallback(async (userId?: string) => {
-    let restaurants = await loadRestaurants(userId);
+  const bootstrapContext = useCallback(async (userId?: string, isSuperadmin?: boolean) => {
+    let restaurants = await loadRestaurants(userId, isSuperadmin);
     if (restaurants.length === 0) return;
 
     // Restore persisted restaurant or use first
@@ -266,10 +302,13 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
       setSession(null);
       setUser(null);
       setStaffUser(null);
+      setIsSuperadmin(false);
+      setSuperadminId(null);
       setActiveRestaurant(null);
       setActiveOutlet(null);
       setAccessibleRestaurants([]);
       setAccessibleOutlets([]);
+      bootstrappedSessionIdRef.current = null;
       setLoading(false);
       initialized = true;
     };
@@ -299,11 +338,30 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
       if (event === 'INITIAL_SESSION' || event === 'SIGNED_IN') {
         setSession(session);
         setUser(session.user ?? null);
-        if (session.user?.email) {
-          Promise.all([
-            loadStaffUser(session.user.email),
-            bootstrapContext(session.user.id),
-          ]).finally(() => {
+
+        const currentSessionId = (session as any)?.session_id
+          || `${session.user?.id || 'anon'}:${(session as any)?.expires_at || ''}`;
+        if (bootstrappedSessionIdRef.current === currentSessionId) {
+          setLoading(false);
+          initialized = true;
+          return;
+        }
+
+        if (session.user?.id) {
+          (async () => {
+            const { isSuperadmin: isSuper, superadminId: sadminId } = await checkAndLoadSuperadmin(session.user.id);
+            setIsSuperadmin(isSuper);
+            if (isSuper) {
+              setSuperadminId(sadminId);
+              setStaffUser(null);
+            } else if (session.user?.email) {
+              await loadStaffUser(session.user.email);
+            } else {
+              setStaffUser(null);
+            }
+            await bootstrapContext(session.user.id, isSuper);
+          })().finally(() => {
+            bootstrappedSessionIdRef.current = currentSessionId;
             setLoading(false);
             initialized = true;
           });
@@ -409,6 +467,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     session,
     loading,
     staffUser,
+    isSuperadmin,
+    superadminId,
     activeRestaurant,
     activeOutlet,
     accessibleRestaurants,

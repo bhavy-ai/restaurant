@@ -2,6 +2,7 @@ import { imageHosts } from './image-hosts.config.mjs';
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  reactStrictMode: false,
   productionBrowserSourceMaps: true,
   distDir: process.env.DIST_DIR || '.next',
 
@@ -18,14 +19,5 @@ const nextConfig = {
     minimumCacheTTL: 60,
   },
 
-  async redirects() {
-    return [
-      {
-        source: '/',
-        destination: '/table-management',
-        permanent: false,
-      },
-    ];
-  }
 };
 export default nextConfig;

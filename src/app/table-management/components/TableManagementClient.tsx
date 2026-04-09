@@ -79,7 +79,7 @@ export default function TableManagementClient() {
   const supabase = createClient();
   const networkStatus = useNetworkStatus();
   const { isOnline } = networkStatus;
-  const { staffUser } = useAuth();
+  const { staffUser, activeRestaurant } = useAuth();
 
   // ── Core state ────────────────────────────────────────────────────────
   const [tables, setTables] = useState<TableData[]>([]);
@@ -851,6 +851,10 @@ export default function TableManagementClient() {
 
   // ── Add Table handler ─────────────────────────────────────────────────
   async function confirmAddTable() {
+    if (!activeRestaurant?.id) {
+      toast.error('No active restaurant selected. Please select a restaurant and try again.');
+      return;
+    }
     if (!addTableLabel.trim()) {
       toast.error('Please enter a table name/number');
       return;
@@ -864,6 +868,7 @@ export default function TableManagementClient() {
       const { data, error } = await supabase
         .from('restaurant_tables')
         .insert({
+          restaurant_id: activeRestaurant.id,
           label: addTableLabel.trim(),
           section: addTableSection,
           capacity: addTableCapacity,

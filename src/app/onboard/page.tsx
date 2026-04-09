@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/contexts/AuthContext';
@@ -40,8 +40,7 @@ const STEPS = [
 
 export default function OnboardPage() {
   const router = useRouter();
-  const { user, signUp, signIn } = useAuth();
-  const supabase = createClient();
+  const { user, loading, signUp, signIn } = useAuth();
 
   const [step, setStep] = useState(1);
   const [submitting, setSubmitting] = useState(false);
@@ -54,7 +53,7 @@ export default function OnboardPage() {
   const [authName, setAuthName] = useState('');
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState('');
-  const [authed, setAuthed] = useState(!!user);
+  const [routeChecking, setRouteChecking] = useState(false);
 
   const [data, setData] = useState<OnboardingData>({
     restaurantName: '',
@@ -76,6 +75,60 @@ export default function OnboardPage() {
   const set = (field: keyof OnboardingData, value: string) =>
     setData((prev) => ({ ...prev, [field]: value }));
 
+  const routeExistingUser = useCallback(async (userId: string) => {
+    const supabase = createClient();
+
+    const { data: saRow } = await supabase
+      .from('platform_superadmins')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('is_active', true)
+      .maybeSingle();
+
+    if (saRow) {
+      router.push('/superadmin');
+      return true;
+    }
+
+    const { count } = await supabase
+      .from('user_restaurant_access')
+      .select('id', { head: true, count: 'exact' })
+      .eq('user_id', userId)
+      .eq('is_active', true);
+
+    if ((count || 0) > 0) {
+      router.push('/table-management');
+      return true;
+    }
+
+    return false;
+  }, [router]);
+
+  useEffect(() => {
+    if (loading) return;
+    if (!user?.id) {
+      setRouteChecking(false);
+      return;
+    }
+
+    let cancelled = false;
+    setRouteChecking(true);
+
+    routeExistingUser(user.id)
+      .then((routed) => {
+        if (!cancelled && !routed) {
+          setRouteChecking(false);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setRouteChecking(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [loading, user?.id, routeExistingUser]);
+
   // ── Auth handlers ──────────────────────────────────────────────
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -89,7 +142,6 @@ export default function OnboardPage() {
       } else {
         await signIn(authEmail, authPassword);
       }
-      setAuthed(true);
     } catch (err: any) {
       setAuthError(err?.message || 'Authentication failed. Please try again.');
     } finally {
@@ -178,7 +230,15 @@ export default function OnboardPage() {
   };
 
   // ── Auth gate ──────────────────────────────────────────────────
-  if (!authed) {
+  if (loading || routeChecking) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-background">
+        <Loader2 size={22} className="animate-spin text-primary" />
+      </div>
+    );
+  }
+
+  if (!user) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background p-4">
         <div className="w-full max-w-sm">

@@ -37,6 +37,7 @@ export default function LoginPage() {
           .from('platform_superadmins')
           .select('id')
           .eq('user_id', userId)
+          .eq('is_active', true)
           .maybeSingle();
         if (saRow) {
           router.push('/superadmin');

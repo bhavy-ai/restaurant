@@ -1,5 +1,7 @@
 'use client';
 import React from 'react';
+import { useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
 import { ShieldOff } from 'lucide-react';
 
@@ -9,7 +11,15 @@ interface RouteGuardProps {
 }
 
 export default function RouteGuard({ routeId, children }: RouteGuardProps) {
-  const { canAccess, staffUser, loading } = useAuth();
+  const { canAccess, staffUser, user, loading } = useAuth();
+  const router = useRouter();
+
+  useEffect(() => {
+    if (loading) return;
+    if (!user) {
+      router.replace('/login');
+    }
+  }, [loading, user, router]);
 
   if (loading) {
     return (
@@ -17,6 +27,10 @@ export default function RouteGuard({ routeId, children }: RouteGuardProps) {
         <div className="w-6 h-6 border-2 border-primary/30 border-t-primary rounded-full animate-spin" />
       </div>
     );
+  }
+
+  if (!user) {
+    return null;
   }
 
   if (!canAccess(routeId)) {
@@ -28,7 +42,7 @@ export default function RouteGuard({ routeId, children }: RouteGuardProps) {
           </div>
           <h2 className="text-lg font-bold text-foreground mb-2">Access Restricted</h2>
           <p className="text-sm text-muted-foreground mb-1">
-            Your role <span className="font-semibold text-foreground capitalize">{staffUser?.role || 'guest'}</span> does not have permission to access this module.
+            Your account <span className="font-semibold text-foreground capitalize">{staffUser?.role || 'signed in'}</span> does not have permission to access this module.
           </p>
           <p className="text-xs text-muted-foreground">Contact your manager or owner to request access.</p>
         </div>

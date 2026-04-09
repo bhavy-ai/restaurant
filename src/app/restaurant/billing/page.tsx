@@ -1,5 +1,6 @@
 import React from 'react';
 import AppLayout from '@/components/AppLayout';
+import RouteGuard from '@/components/RouteGuard';
 import BillingClient from './components/BillingClient';
 
 export const metadata = {
@@ -9,10 +10,12 @@ export const metadata = {
 
 export default function BillingPage() {
   return (
-    <AppLayout>
-      <div className="p-4 lg:p-6 max-w-5xl mx-auto">
-        <BillingClient />
-      </div>
+    <AppLayout currentPath="/restaurant/billing">
+      <RouteGuard routeId="admin-panel">
+        <div className="p-4 lg:p-6 max-w-5xl mx-auto">
+          <BillingClient />
+        </div>
+      </RouteGuard>
     </AppLayout>
   );
 }

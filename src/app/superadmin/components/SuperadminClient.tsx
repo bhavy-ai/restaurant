@@ -2,7 +2,8 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { Building2, Search, Plus, Check, X, ChevronDown, RefreshCw, AlertCircle, Loader2, ToggleLeft, ToggleRight, MapPin, TrendingUp, Shield, Utensils, ShieldOff, ClipboardList, Receipt, CalendarClock, Pencil, LogOut } from 'lucide-react';
+import { useAuth } from '@/contexts/AuthContext';
+import { Building2, Search, Plus, Check, X, ChevronDown, RefreshCw, AlertCircle, Loader2, ToggleLeft, ToggleRight, MapPin, TrendingUp, Shield, Utensils, ShieldOff, ClipboardList, Receipt, CalendarClock, Pencil, LogOut, Trash2 } from 'lucide-react';
 import AuditLogDashboard from './AuditLogDashboard';
 import InvoicesDashboard from './InvoicesDashboard';
 import SubscriptionScheduler from './SubscriptionScheduler';
@@ -47,9 +48,11 @@ const PLAN_LABELS: Record<string, string> = {
   free: 'Free',
 };
 
-export default function SuperadminClient() {
-  const supabase = createClient();
+const supabase = createClient() as any;
 
+export default function SuperadminClient() {
+  const { isSuperadmin: isSuperAdminFromContext, superadminId: superadminIdFromContext } = useAuth();
+  
   const [activeTab, setActiveTab] = useState<'restaurants' | 'audit' | 'invoices' | 'scheduler' | 'saas' | 'planaudit'>('restaurants');
 
   const [restaurants, setRestaurants] = useState<Restaurant[]>([]);
@@ -61,7 +64,7 @@ export default function SuperadminClient() {
 
   // Superadmin access guard
   const [isSuperAdmin, setIsSuperAdmin] = useState<boolean | null>(null);
-  const [accessChecking, setAccessChecking] = useState(true);
+  const [accessChecking, setAccessChecking] = useState(false);
   const [superadminId, setSuperadminId] = useState<string | null>(null);
 
   // Selected restaurant detail
@@ -139,56 +142,42 @@ export default function SuperadminClient() {
 
       if (err) throw err;
 
-      // Load outlet counts
-      const enriched = await Promise.all(
-        (data || []).map(async (r: any) => {
-          const { count } = await supabase
-            .from('outlets')
-            .select('*', { count: 'exact', head: true })
-            .eq('restaurant_id', r.id);
-          return { ...r, outlet_count: count || 0 };
-        })
-      );
+      // Load all outlet rows once and compute counts client-side.
+      const { data: outletRows, error: outletErr } = await supabase
+        .from('outlets')
+        .select('restaurant_id');
+      if (outletErr) throw outletErr;
+
+      const outletCountByRestaurant = (outletRows || []).reduce((acc: Record<string, number>, row: any) => {
+        const restaurantId = row?.restaurant_id;
+        if (!restaurantId) return acc;
+        acc[restaurantId] = (acc[restaurantId] || 0) + 1;
+        return acc;
+      }, {});
+
+      const enriched = (data || []).map((r: any) => ({
+        ...r,
+        outlet_count: outletCountByRestaurant[r.id] || 0,
+      }));
 
       setRestaurants(enriched);
       setStats({
         total: enriched.length,
-        active: enriched.filter((r) => r.is_active).length,
-        pending: enriched.filter((r) => r.onboarding_status === 'pending').length,
-        enterprise: enriched.filter((r) => r.plan === 'enterprise').length,
+        active: enriched.filter((r: any) => r.is_active).length,
+        pending: enriched.filter((r: any) => r.onboarding_status === 'pending').length,
+        enterprise: enriched.filter((r: any) => r.plan === 'enterprise').length,
       });
     } catch (err: any) {
       setError(err?.message || 'Failed to load restaurants');
     } finally {
       setLoading(false);
     }
-  }, [supabase]);
+  }, []);
 
   useEffect(() => {
-    const checkSuperAdmin = async () => {
-      try {
-        const { data: { user } } = await supabase.auth.getUser();
-        if (!user) {
-          setIsSuperAdmin(false);
-          setAccessChecking(false);
-          return;
-        }
-        const { data, error: err } = await supabase
-          .from('platform_superadmins')
-          .select('id')
-          .eq('user_id', user.id)
-          .eq('is_active', true)
-          .maybeSingle();
-        setIsSuperAdmin(!err && !!data);
-        if (data) setSuperadminId(data.id);
-      } catch {
-        setIsSuperAdmin(false);
-      } finally {
-        setAccessChecking(false);
-      }
-    };
-    checkSuperAdmin();
-  }, [supabase]);
+    setIsSuperAdmin(isSuperAdminFromContext);
+    setSuperadminId(superadminIdFromContext);
+  }, [isSuperAdminFromContext, superadminIdFromContext]);
 
   useEffect(() => { loadRestaurants(); }, [loadRestaurants]);
 
@@ -272,6 +261,50 @@ export default function SuperadminClient() {
         'restaurant',
         `Plan changed for "${r.name}" (id: ${r.id}) from "${oldPlan}" to "${plan}"`
       );
+    }
+  };
+
+  const handleDeleteRestaurant = async (r: Restaurant) => {
+    const ok = window.confirm(
+      `Delete restaurant "${r.name}" permanently? This cannot be undone.`
+    );
+    if (!ok) return;
+
+    setError('');
+    try {
+      const { count: outletCount, error: outletCountError } = await supabase
+        .from('outlets')
+        .select('id', { count: 'exact', head: true })
+        .eq('restaurant_id', r.id);
+
+      if (outletCountError) throw outletCountError;
+
+      if ((outletCount || 0) > 0) {
+        setError(`Cannot delete \"${r.name}\" because it still has ${(outletCount || 0)} outlet(s). Remove outlets first or deactivate the restaurant.`);
+        return;
+      }
+
+      const { error: deleteError } = await supabase
+        .from('restaurants')
+        .delete()
+        .eq('id', r.id);
+
+      if (deleteError) throw deleteError;
+
+      if (selected?.id === r.id) {
+        setSelected(null);
+        setOutlets([]);
+      }
+
+      await logAudit(
+        'restaurant_deleted',
+        'restaurant',
+        `Restaurant "${r.name}" (id: ${r.id}) permanently deleted by superadmin`
+      );
+
+      await loadRestaurants();
+    } catch (err: any) {
+      setError(err?.message || 'Failed to delete restaurant');
     }
   };
 
@@ -671,6 +704,13 @@ export default function SuperadminClient() {
                         </div>
                         <div className="flex items-center gap-2 flex-shrink-0">
                           <button
+                            onClick={(e) => { e.stopPropagation(); handleDeleteRestaurant(r); }}
+                            className="p-1.5 rounded-lg transition-colors text-red-400 hover:bg-red-500/10"
+                            title="Delete restaurant"
+                          >
+                            <Trash2 size={16} />
+                          </button>
+                          <button
                             onClick={(e) => { e.stopPropagation(); handleToggleActive(r); }}
                             className={`p-1.5 rounded-lg transition-colors ${r.is_active ? 'text-green-400 hover:bg-green-500/10' : 'text-muted-foreground hover:bg-secondary'}`}
                             title={r.is_active ? 'Deactivate' : 'Activate'}
@@ -692,6 +732,13 @@ export default function SuperadminClient() {
                   <div className="flex items-center justify-between px-4 py-3 border-b border-border">
                     <h3 className="text-sm font-bold text-foreground">Restaurant Details</h3>
                     <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => handleDeleteRestaurant(selected)}
+                        className="p-1.5 rounded-lg text-muted-foreground hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                        title="Delete restaurant"
+                      >
+                        <Trash2 size={13} />
+                      </button>
                       <button
                         onClick={() => handleOpenEdit(selected)}
                         className="p-1.5 rounded-lg text-muted-foreground hover:text-primary hover:bg-primary/10 transition-colors"

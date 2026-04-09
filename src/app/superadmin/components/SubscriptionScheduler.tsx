@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import { useAuth } from '@/contexts/AuthContext';
 import {
   CalendarClock, Play, RefreshCw, AlertCircle, Loader2,
   CheckCircle2, ChevronRight, Download, IndianRupee,
@@ -127,6 +128,8 @@ const PLAN_COLORS: Record<string, string> = {
   free: 'bg-secondary text-muted-foreground border-border',
 };
 
+const supabase = createClient();
+
 function getBillingMonth(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
 }
@@ -175,9 +178,7 @@ function buildPdfData(inv: SubscriptionInvoice, restaurantName?: string, restaur
 }
 
 export default function SubscriptionScheduler() {
-  const supabase = createClient();
-
-  const [superadminId, setSuperadminId] = useState<string | null>(null);
+  const { superadminId } = useAuth();
   const [chargingInvoiceId, setChargingInvoiceId] = useState<string | null>(null);
   const [chargeError, setChargeError] = useState<string>('');
   const [emailingInvoiceId, setEmailingInvoiceId] = useState<string | null>(null);
@@ -210,21 +211,6 @@ export default function SubscriptionScheduler() {
 
   // Plans cache
   const [plans, setPlans] = useState<Record<string, PlanConfig>>({});
-
-  // Load superadmin id
-  useEffect(() => {
-    const load = async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) return;
-      const { data } = await supabase
-        .from('platform_superadmins')
-        .select('id')
-        .eq('user_id', user.id)
-        .maybeSingle();
-      if (data) setSuperadminId(data.id);
-    };
-    load();
-  }, [supabase]);
 
   // Load plans
   useEffect(() => {

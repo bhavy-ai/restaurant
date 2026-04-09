@@ -671,6 +671,10 @@ export const staffService = {
     role: string;
     outlet: string;
   }, ctx?: RequestContext) {
+    if (!ctx?.restaurantId) {
+      throw new Error('Missing restaurant context for staff creation');
+    }
+
     const supabase = createClient();
     const { data, error } = await supabase.from('staff_users').insert({
       name: staff.name,
@@ -680,7 +684,7 @@ export const staffService = {
       outlet: staff.outlet,
       status: 'active',
       permissions: [],
-      ...(ctx?.restaurantId ? { restaurant_id: ctx.restaurantId } : {}),
+      restaurant_id: ctx.restaurantId,
     }).select().single();
     if (error) throw error;
     return mapStaffUser(data);

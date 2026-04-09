@@ -27,6 +27,8 @@ const PLAN_COLORS: Record<string, string> = {
 
 const PAGE_SIZE = 20;
 
+const supabase = createClient();
+
 const fmtDate = (iso: string) => {
   const d = new Date(iso);
   return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) +
@@ -34,8 +36,6 @@ const fmtDate = (iso: string) => {
 };
 
 export default function PlanChangeAudit() {
-  const supabase = createClient();
-
   const [records, setRecords] = useState<PlanChangeRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');

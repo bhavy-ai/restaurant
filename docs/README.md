@@ -34,6 +34,7 @@ Welcome to the RestroOS documentation. This index lists all available documentat
 | 24 | [Shift Management](./24-shift-management.md) | Shift lifecycle, handover, cash count |
 | 25 | [File Structure](./25-file-structure.md) | Complete project directory and service map |
 | 26 | [Environment Variables](./26-environment-variables.md) | All env vars, usage, and configuration status |
+| 27 | [Auth & Routing Hardening](./27-auth-routing-hardening.md) | No-guest auth policy, route guard fixes, sidebar permission mapping |
 
 ---
 

@@ -39,6 +39,8 @@ const PLAN_COLORS: Record<string, string> = {
   free: '#94a3b8',
 };
 
+const supabase = createClient();
+
 function formatINR(val: number) {
   if (val >= 100000) return `₹${(val / 100000).toFixed(1)}L`;
   if (val >= 1000) return `₹${(val / 1000).toFixed(1)}K`;
@@ -73,7 +75,6 @@ function StatCard({
 }
 
 export default function SaasMetricsDashboard() {
-  const supabase = createClient();
   const [loading, setLoading] = useState(true);
   const [metrics, setMetrics] = useState<MonthlyMetric[]>([]);
   const [planDist, setPlanDist] = useState<PlanDist[]>([]);

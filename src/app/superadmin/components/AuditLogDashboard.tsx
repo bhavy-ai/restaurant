@@ -31,9 +31,9 @@ const ACTION_OPTIONS = [
 
 const PAGE_SIZE = 20;
 
-export default function AuditLogDashboard() {
-  const supabase = createClient();
+const supabase = createClient();
 
+export default function AuditLogDashboard() {
   const [logs, setLogs] = useState<AuditLog[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
