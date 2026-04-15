@@ -1,5 +1,5 @@
 'use client';
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import AppLogo from '@/components/ui/AppLogo';
@@ -81,6 +81,7 @@ interface SidebarProps {
 export default function Sidebar({ currentPath, onClose }: SidebarProps) {
   const [collapsed, setCollapsed] = useState(false);
   const [isOnline] = useState(true);
+  const [badgeCounts, setBadgeCounts] = useState({ posBilling: 0, kitchenDisplay: 0 });
   const [showRestaurantMenu, setShowRestaurantMenu] = useState(false);
   const [showOutletMenu, setShowOutletMenu] = useState(false);
   const [switchingRestaurant, setSwitchingRestaurant] = useState(false);
@@ -102,10 +103,88 @@ export default function Sidebar({ currentPath, onClose }: SidebarProps) {
     isSuperadmin: isSuperAdminFromContext,
   } = useAuth();
   const router = useRouter();
+  const supabase = createClient();
+  const restaurantId = activeRestaurant?.id;
+  const outletSlug = activeOutlet?.slug || staffUser?.outlet || 'koramangala';
 
   useEffect(() => {
     setIsSuperAdmin(isSuperAdminFromContext);
   }, [isSuperAdminFromContext]);
+
+  // Live badges: low-load pattern (initial count + realtime change events)
+  const loadLiveBadges = useCallback(async () => {
+    if (!restaurantId) {
+      setBadgeCounts({ posBilling: 0, kitchenDisplay: 0 });
+      return;
+    }
+    try {
+      let posQuery = supabase
+        .from('restaurant_tables')
+        .select('*', { head: true, count: 'exact' })
+        .eq('status', 'bill_requested')
+        .eq('outlet', outletSlug)
+        .eq('restaurant_id', restaurantId);
+
+      let kdsQuery = supabase
+        .from('kots')
+        .select('*', { head: true, count: 'exact' })
+        .eq('outlet', outletSlug)
+        .eq('restaurant_id', restaurantId)
+        .not('status', 'in', '("bumped","voided")');
+
+      const [{ count: posCount, error: posErr }, { count: kdsCount, error: kdsErr }] = await Promise.all([
+        posQuery,
+        kdsQuery,
+      ]);
+
+      if (posErr || kdsErr) {
+        setBadgeCounts((prev) => prev);
+        return;
+      }
+
+      setBadgeCounts({
+        posBilling: posCount || 0,
+        kitchenDisplay: kdsCount || 0,
+      });
+    } catch {
+      // non-blocking
+    }
+  }, [supabase, restaurantId, outletSlug]);
+
+  useEffect(() => {
+    loadLiveBadges();
+  }, [loadLiveBadges]);
+
+  useEffect(() => {
+    if (!restaurantId) return;
+
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+    const queueRefresh = () => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => {
+        loadLiveBadges();
+      }, 250);
+    };
+
+    const channel = supabase
+      .channel('sidebar_live_badges')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'kots' }, (payload) => {
+        if (payload.new && payload.new.outlet !== outletSlug) return;
+        if (payload.new && payload.new.restaurant_id !== restaurantId) return;
+        queueRefresh();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'restaurant_tables' }, (payload) => {
+        if (payload.new && payload.new.outlet !== outletSlug) return;
+        if (payload.new && payload.new.restaurant_id !== restaurantId) return;
+        queueRefresh();
+      })
+      .subscribe();
+
+    return () => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      supabase.removeChannel(channel);
+    };
+  }, [supabase, restaurantId, outletSlug, loadLiveBadges]);
 
   // Close dropdowns on outside click
   useEffect(() => {
@@ -298,6 +377,12 @@ export default function Sidebar({ currentPath, onClose }: SidebarProps) {
                 const requiredPermission = navPermissionMap[item.id];
                 if (requiredPermission && !canAccess(requiredPermission)) return null;
                 const isActive = currentPath === item.path;
+                const liveBadge = item.id === 'pos-billing'
+                  ? badgeCounts.posBilling
+                  : item.id === 'kitchen-display-system'
+                    ? badgeCounts.kitchenDisplay
+                    : item.badge;
+                const liveBadgeColor = item.badgeColor || 'bg-primary';
                 return (
                   <Link
                     key={`nav-${item.id}`}
@@ -311,13 +396,13 @@ export default function Sidebar({ currentPath, onClose }: SidebarProps) {
                   >
                     <span className={`flex-shrink-0 ${isActive ? 'text-primary' : ''}`}>{item.icon}</span>
                     {!collapsed && <span className="truncate">{item.label}</span>}
-                    {!collapsed && item.badge && (
-                      <span className={`ml-auto text-[10px] font-bold px-1.5 py-0.5 rounded-full text-white ${item.badgeColor}`}>
-                        {item.badge}
+                    {!collapsed && Boolean(liveBadge) && (
+                      <span className={`ml-auto text-[10px] font-bold px-1.5 py-0.5 rounded-full text-white ${liveBadgeColor}`}>
+                        {liveBadge}
                       </span>
                     )}
-                    {collapsed && item.badge && (
-                      <span className={`absolute top-1 right-1 w-2 h-2 rounded-full ${item.badgeColor}`} />
+                    {collapsed && Boolean(liveBadge) && (
+                      <span className={`absolute top-1 right-1 w-2 h-2 rounded-full ${liveBadgeColor}`} />
                     )}
                     {collapsed && (
                       <div className="absolute left-full ml-2 px-2 py-1 bg-secondary border border-border rounded text-xs text-foreground whitespace-nowrap opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50">

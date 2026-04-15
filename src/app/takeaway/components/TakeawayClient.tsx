@@ -1,9 +1,13 @@
 'use client';
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { toast } from 'sonner';
 import { captureException } from '@/lib/errorTracking';
 import { Bike, Plus, Search, CheckCircle, XCircle, Truck, ShoppingBag, Phone, MapPin } from 'lucide-react';
+import { useAuth } from '@/contexts/AuthContext';
+import { offlineQueue, generateIdempotencyKey } from '@/lib/offlineQueue';
+import { useNetworkStatus } from '@/hooks/useNetworkStatus';
+import { kotService } from '@/lib/services/restaurantService';
 
 type OrderStatus = 'pending' | 'confirmed' | 'preparing' | 'ready' | 'dispatched' | 'delivered' | 'cancelled';
 type OrderType = 'takeaway' | 'delivery' | 'aggregator';
@@ -44,8 +48,17 @@ const defaultForm = {
   items: [{ name: '', qty: 1, price: 0 }], paymentMode: 'cash', notes: '', estimatedTime: '30',
 };
 
+function getDraftKey(restaurantId?: string, outletSlug?: string) {
+  return restaurantId ? `restro_takeaway_draft_${restaurantId}_${outletSlug || 'default'}` : null;
+}
+
 // Deduct ingredient stock based on recipe mappings for ordered items
-async function deductRecipeStock(supabase: ReturnType<typeof createClient>, items: Array<{ name: string; qty: number }>) {
+async function deductRecipeStock(
+  supabase: ReturnType<typeof createClient>,
+  items: Array<{ name: string; qty: number }>,
+  outlet: string,
+  restaurantId?: string
+) {
   try {
     // Get menu items matching the ordered item names
     const itemNames = items.map(i => i.name.trim()).filter(Boolean);
@@ -54,7 +67,8 @@ async function deductRecipeStock(supabase: ReturnType<typeof createClient>, item
     const { data: menuItems } = await supabase
       .from('menu_items')
       .select('id, name')
-      .eq('outlet', 'koramangala')
+      .eq('outlet', outlet)
+      .eq('restaurant_id', restaurantId || '')
       .in('name', itemNames);
 
     if (!menuItems || menuItems.length === 0) return;
@@ -113,9 +127,56 @@ async function deductRecipeStock(supabase: ReturnType<typeof createClient>, item
   }
 }
 
+async function createTakeawayKOT(
+  supabase: ReturnType<typeof createClient>,
+  items: Array<{ name: string; qty: number; price: number }>,
+  orderNumber: string,
+  orderType: OrderType,
+  outlet: string,
+  restaurantId?: string,
+  orderId?: string,
+) {
+  const cleanNames = items.map((i) => i.name.trim()).filter(Boolean);
+  if (cleanNames.length === 0) return;
+
+  const { data: menuItems } = await supabase
+    .from('menu_items')
+    .select('id, name, is_veg')
+    .eq('outlet', outlet)
+    .eq('restaurant_id', restaurantId || '')
+    .in('name', cleanNames);
+
+  const menuMap = new Map<string, { id: string; isVeg: boolean }>();
+  (menuItems || []).forEach((row: any) => menuMap.set(row.name, { id: row.id, isVeg: Boolean(row.is_veg) }));
+
+  await kotService.create({
+    kotNumber: `KOT-${orderNumber}`,
+    orderId: undefined,
+    tableLabel: orderNumber,
+    orderType,
+    station: 'Main Kitchen',
+    priority: 'normal',
+    steward: 'Counter',
+    covers: 0,
+    outlet,
+    items: items.map((item) => ({
+      menuItemId: menuMap.get(item.name.trim())?.id,
+      name: item.name,
+      qty: item.qty,
+      isVeg: menuMap.get(item.name.trim())?.isVeg ?? false,
+    })),
+  }, restaurantId ? { restaurantId, outletSlug: outlet } : undefined);
+}
+
 export default function TakeawayClient() {
   const supabase = createClient();
+  const { activeRestaurant, activeOutlet } = useAuth();
+  const networkStatus = useNetworkStatus();
+  const { isOnline } = networkStatus;
+  const restaurantId = activeRestaurant?.id;
+  const outletSlug = activeOutlet?.slug || 'koramangala';
   const [orders, setOrders] = useState<TakeawayOrder[]>([]);
+  const [optimisticOrders, setOptimisticOrders] = useState<TakeawayOrder[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [filterStatus, setFilterStatus] = useState<OrderStatus | 'all'>('all');
@@ -124,11 +185,24 @@ export default function TakeawayClient() {
   const [form, setForm] = useState(defaultForm);
   const [saving, setSaving] = useState(false);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const draftKey = getDraftKey(restaurantId, outletSlug);
+  const draftLoadedRef = React.useRef(false);
 
   const load = useCallback(async () => {
+    if (!restaurantId) {
+      setOrders([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
-      const { data, error } = await supabase.from('takeaway_orders').select('*').eq('outlet', 'koramangala').order('created_at', { ascending: false }).limit(50);
+      const { data, error } = await supabase
+        .from('takeaway_orders')
+        .select('*')
+        .eq('restaurant_id', restaurantId)
+        .eq('outlet', outletSlug)
+        .order('created_at', { ascending: false })
+        .limit(50);
       if (error) throw error;
       setOrders((data || []).map((r: any) => ({
         id: r.id, orderNumber: r.order_number, orderType: r.order_type, aggregator: r.aggregator,
@@ -145,9 +219,51 @@ export default function TakeawayClient() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [restaurantId, outletSlug]);
 
   useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    draftLoadedRef.current = false;
+    if (!draftKey) return;
+    try {
+      const raw = localStorage.getItem(draftKey);
+      if (!raw) return;
+      const draft = JSON.parse(raw);
+      if (draft && typeof draft === 'object') {
+        setShowForm(Boolean(draft.showForm));
+        setForm((prev) => ({
+          ...prev,
+          ...draft.form,
+          items: Array.isArray(draft.form?.items) && draft.form.items.length > 0 ? draft.form.items : prev.items,
+        }));
+      }
+    } catch {
+      // Ignore malformed drafts and fall back to a fresh form.
+    } finally {
+      draftLoadedRef.current = true;
+    }
+  }, [draftKey]);
+
+  useEffect(() => {
+    if (!draftKey || !draftLoadedRef.current) return;
+    try {
+      localStorage.setItem(draftKey, JSON.stringify({ showForm, form }));
+    } catch {
+      // Non-blocking
+    }
+  }, [draftKey, showForm, form]);
+
+  const displayedOrders = useMemo(() => {
+    const merged = [...optimisticOrders, ...orders];
+    const seen = new Set<string>();
+    return merged.filter((order) => {
+      const key = order.orderNumber;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [orders, optimisticOrders]);
 
   const advanceStatus = async (order: TakeawayOrder) => {
     const next = STATUS_CONFIG[order.status].next;
@@ -166,8 +282,22 @@ export default function TakeawayClient() {
   };
 
   const cancelOrder = async (id: string) => {
+    const queueKey = generateIdempotencyKey(`takeaway_cancel_${id}`);
+    const target = displayedOrders.find((order) => order.id === id);
     try {
+      if (!isOnline) {
+        await offlineQueue.enqueue('takeaway_cancel', { orderId: id, restaurantId, outlet: outletSlug }, queueKey);
+        if (target) {
+          setOptimisticOrders((prev) => prev.map((o) => o.id === id ? { ...o, status: 'cancelled' } : o));
+          setOrders((prev) => prev.map((o) => o.id === id ? { ...o, status: 'cancelled' } : o));
+        }
+        toast.success('Order cancelled — will sync when online');
+        return;
+      }
+
       await supabase.from('takeaway_orders').update({ status: 'cancelled', updated_at: new Date().toISOString() }).eq('id', id);
+      await supabase.from('kots').update({ status: 'voided' }).eq('order_id', id);
+      setOptimisticOrders((prev) => prev.filter((o) => o.id !== id));
       setOrders(prev => prev.map(o => o.id === id ? { ...o, status: 'cancelled' } : o));
       toast.success('Order cancelled');
     } catch (e: any) {
@@ -177,6 +307,10 @@ export default function TakeawayClient() {
 
   const createOrder = async () => {
     if (!form.customerName.trim()) return;
+    if (!restaurantId) {
+      toast.error('No active restaurant selected');
+      return;
+    }
     setSaving(true);
     try {
       const items = form.items.filter(i => i.name.trim());
@@ -184,19 +318,56 @@ export default function TakeawayClient() {
       const gstAmount = Math.round(subtotal * 0.05);
       const total = subtotal + gstAmount;
       const orderNumber = `TKW-${Date.now().toString().slice(-6)}`;
-      const { error } = await supabase.from('takeaway_orders').insert({
-        outlet: 'koramangala', order_number: orderNumber, order_type: form.orderType,
+      const takeawayPayload = {
+        restaurant_id: restaurantId,
+        outlet: outletSlug,
+        order_number: orderNumber,
+        order_type: form.orderType,
+        aggregator: null,
         customer_name: form.customerName, customer_phone: form.customerPhone,
         delivery_address: form.deliveryAddress, items, subtotal, gst_amount: gstAmount,
         discount_amount: 0, total, payment_mode: form.paymentMode, status: 'pending',
         estimated_time: Number(form.estimatedTime), notes: form.notes,
-      });
+      };
+
+      if (!isOnline) {
+        await offlineQueue.enqueue('takeaway_create', takeawayPayload, generateIdempotencyKey(`takeaway_${orderNumber}`));
+        setOptimisticOrders((prev) => [{
+          id: `local-${orderNumber}`,
+          orderNumber,
+          orderType: form.orderType,
+          aggregator: null,
+          customerName: form.customerName,
+          customerPhone: form.customerPhone,
+          deliveryAddress: form.deliveryAddress,
+          items,
+          subtotal,
+          gstAmount,
+          discountAmount: 0,
+          total,
+          paymentMode: form.paymentMode,
+          status: 'pending',
+          assignedRider: '',
+          estimatedTime: Number(form.estimatedTime),
+          notes: form.notes,
+          createdAt: new Date().toISOString(),
+        }, ...prev]);
+        toast.success(`Order ${orderNumber} queued — will sync when online`);
+        setShowForm(false);
+        setForm(defaultForm);
+        return;
+      }
+
+      const { data: orderRow, error } = await supabase.from('takeaway_orders').insert(takeawayPayload).select('id').single();
       if (error) throw error;
 
+      await createTakeawayKOT(supabase, items, orderNumber, form.orderType, outletSlug, restaurantId, orderRow?.id);
+
       // Deduct ingredient stock based on recipe mappings
-      await deductRecipeStock(supabase, items);
+      await deductRecipeStock(supabase, items, outletSlug, restaurantId);
 
       toast.success(`Order ${orderNumber} created`);
+      setOptimisticOrders((prev) => prev.filter((o) => o.orderNumber !== orderNumber));
       setShowForm(false);
       setForm(defaultForm);
       load();
@@ -280,7 +451,12 @@ export default function TakeawayClient() {
         <div className="flex justify-center py-12"><div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" /></div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {filtered.map(order => {
+          {displayedOrders.filter(order => {
+            if (filterStatus !== 'all' && order.status !== filterStatus) return false;
+            if (filterType !== 'all' && order.orderType !== filterType) return false;
+            if (search && !order.customerName.toLowerCase().includes(search.toLowerCase()) && !order.orderNumber.includes(search)) return false;
+            return true;
+          }).map(order => {
             const sc = STATUS_CONFIG[order.status];
             const nextStatus = sc.next;
             return (
@@ -340,7 +516,12 @@ export default function TakeawayClient() {
               </div>
             );
           })}
-          {filtered.length === 0 && (
+          {displayedOrders.filter(order => {
+            if (filterStatus !== 'all' && order.status !== filterStatus) return false;
+            if (filterType !== 'all' && order.orderType !== filterType) return false;
+            if (search && !order.customerName.toLowerCase().includes(search.toLowerCase()) && !order.orderNumber.includes(search)) return false;
+            return true;
+          }).length === 0 && (
             <div className="col-span-full text-center py-12 text-muted-foreground">
               <Bike size={32} className="mx-auto mb-2 opacity-30" />
               <p className="text-sm">No orders found</p>

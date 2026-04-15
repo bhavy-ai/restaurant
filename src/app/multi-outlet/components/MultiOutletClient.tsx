@@ -3,14 +3,9 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { Globe, TrendingUp, Package, Users, IndianRupee, BarChart3, ArrowUpRight, ArrowDownRight } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
+import { useAuth } from '@/contexts/AuthContext';
 
 type ReportView = 'sales' | 'stock' | 'staff';
-
-const OUTLETS = [
-  { id: 'koramangala', name: 'Koramangala', city: 'Bengaluru' },
-  { id: 'indiranagar', name: 'Indiranagar', city: 'Bengaluru' },
-  { id: 'whitefield', name: 'Whitefield', city: 'Bengaluru' },
-];
 
 interface OutletMetric {
   id: string;
@@ -42,8 +37,12 @@ interface StaffRow {
   kitchen: number;
 }
 
+const COLORS = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4'];
+
 export default function MultiOutletClient() {
   const supabase = createClient();
+  const { activeRestaurant, accessibleOutlets } = useAuth();
+  const outlets = accessibleOutlets.map((o) => ({ id: o.slug, name: o.name, city: o.address || '' }));
   const [activeView, setActiveView] = useState<ReportView>('sales');
   const [dateRange, setDateRange] = useState<'7d' | '30d' | 'mtd'>('7d');
   const [loading, setLoading] = useState(true);
@@ -67,22 +66,35 @@ export default function MultiOutletClient() {
   }, [dateRange]);
 
   const loadData = useCallback(async () => {
+    if (!activeRestaurant?.id || outlets.length === 0) {
+      setOutletMetrics([]);
+      setSalesComparison([]);
+      setStockComparison([]);
+      setStaffComparison([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
       const since = getDateFilter();
       const prevSince = getPrevDateFilter();
+      const outletIds = outlets.map((o) => o.id);
 
       // ── Bills per outlet (net_amount = actual revenue) ─────
       const [billsRes, prevBillsRes, ingredientsRes, staffRes] = await Promise.all([
         supabase.from('bills').select('outlet, net_amount, gross_amount, created_at, status')
+          .eq('restaurant_id', activeRestaurant.id)
+          .in('outlet', outletIds)
           .gte('created_at', since)
           .in('status', ['settled', 'open']),
         supabase.from('bills').select('outlet, net_amount')
+          .eq('restaurant_id', activeRestaurant.id)
+          .in('outlet', outletIds)
           .gte('created_at', prevSince)
           .lt('created_at', since)
           .in('status', ['settled', 'open']),
-        supabase.from('ingredients').select('outlet, name, current_stock, reorder_level'),
-        supabase.from('staff_users').select('outlet, role, status'),
+        supabase.from('ingredients').select('outlet, name, current_stock, reorder_level').eq('restaurant_id', activeRestaurant.id).in('outlet', outletIds),
+        supabase.from('staff_users').select('outlet, role, status').eq('restaurant_id', activeRestaurant.id).in('outlet', outletIds),
       ]);
 
       const billsData = billsRes.data || [];
@@ -97,7 +109,7 @@ export default function MultiOutletClient() {
       });
 
       // ── Build outlet metrics ───────────────────────────────
-      const metrics: OutletMetric[] = OUTLETS.map(o => {
+      const metrics: OutletMetric[] = outlets.map(o => {
         const outletBills = billsData.filter((b: any) => b.outlet === o.id);
         const revenue = outletBills.reduce((s: number, b: any) => s + Number(b.net_amount || 0), 0);
         const orders = outletBills.length;
@@ -120,7 +132,7 @@ export default function MultiOutletClient() {
       const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
       const salesComp: SalesComparison[] = days.map(d => {
         const row: SalesComparison = { period: d };
-        OUTLETS.forEach(o => { row[o.id] = dayMap[d]?.[o.id] || 0; });
+        outlets.forEach(o => { row[o.id] = dayMap[d]?.[o.id] || 0; });
         return row;
       });
       setSalesComparison(salesComp);
@@ -129,7 +141,7 @@ export default function MultiOutletClient() {
       const ingNames = [...new Set(ingredientsData.map((i: any) => i.name as string))].slice(0, 8);
       const stockRows: StockRow[] = ingNames.map(name => {
         const row: StockRow = { item: name, reorder: 0 };
-        OUTLETS.forEach(o => {
+        outlets.forEach(o => {
           const match = ingredientsData.find((i: any) => i.outlet === o.id && i.name === name);
           row[o.id] = match ? Number(match.current_stock) : 0;
           if (match && Number(match.reorder_level) > 0) row.reorder = Number(match.reorder_level);
@@ -139,7 +151,7 @@ export default function MultiOutletClient() {
       setStockComparison(stockRows);
 
       // ── Staff comparison ───────────────────────────────────
-      const staffRows: StaffRow[] = OUTLETS.map(o => {
+      const staffRows: StaffRow[] = outlets.map(o => {
         const outletStaff = staffData.filter((s: any) => s.outlet === o.id);
         return {
           outlet: o.name,
@@ -157,7 +169,7 @@ export default function MultiOutletClient() {
     } finally {
       setLoading(false);
     }
-  }, [dateRange, getDateFilter, getPrevDateFilter]);
+  }, [dateRange, getDateFilter, getPrevDateFilter, activeRestaurant?.id, outlets]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
@@ -187,7 +199,7 @@ export default function MultiOutletClient() {
         <>
           {/* Outlet Status Cards */}
           <div className="grid grid-cols-3 gap-4">
-            {OUTLETS.map(outlet => {
+            {outlets.map(outlet => {
               const metrics = outletMetrics.find(m => m.id === outlet.id);
               return (
                 <div key={outlet.id} className="bg-card border border-border rounded-xl p-4">
@@ -216,7 +228,7 @@ export default function MultiOutletClient() {
             {[
               { label: 'Combined Revenue', value: `₹${totalRevenue.toLocaleString('en-IN')}`, icon: <IndianRupee size={16} />, color: 'text-primary' },
               { label: 'Total Orders', value: totalOrders, icon: <BarChart3 size={16} />, color: 'text-accent' },
-              { label: 'Active Outlets', value: OUTLETS.length, icon: <Globe size={16} />, color: 'text-blue-400' },
+              { label: 'Active Outlets', value: outlets.length, icon: <Globe size={16} />, color: 'text-blue-400' },
               { label: 'Total Staff', value: totalStaff, icon: <Users size={16} />, color: 'text-purple-400' },
             ].map(kpi => (
               <div key={kpi.label} className="bg-card border border-border rounded-xl p-4">
@@ -245,7 +257,7 @@ export default function MultiOutletClient() {
             <div className="space-y-4">
               <div className="bg-card border border-border rounded-xl p-5">
                 <h3 className="text-sm font-semibold text-foreground mb-4">Daily Revenue by Outlet</h3>
-                {salesComparison.every(d => OUTLETS.every(o => (d[o.id] as number) === 0)) ? (
+                {salesComparison.every(d => outlets.every(o => (d[o.id] as number) === 0)) ? (
                   <div className="flex items-center justify-center h-40 text-muted-foreground text-sm">No sales data for this period</div>
                 ) : (
                   <ResponsiveContainer width="100%" height={300}>
@@ -255,9 +267,9 @@ export default function MultiOutletClient() {
                       <YAxis tick={{ fontSize: 11, fill: 'hsl(var(--muted-foreground))' }} tickFormatter={v => `₹${(v/1000).toFixed(0)}k`} />
                       <Tooltip formatter={(v: number) => [`₹${v.toLocaleString('en-IN')}`, '']} contentStyle={{ background: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', borderRadius: 8, fontSize: 12 }} />
                       <Legend />
-                      <Bar dataKey="koramangala" name="Koramangala" fill="#6366f1" radius={[4, 4, 0, 0]} />
-                      <Bar dataKey="indiranagar" name="Indiranagar" fill="#22c55e" radius={[4, 4, 0, 0]} />
-                      <Bar dataKey="whitefield" name="Whitefield" fill="#f59e0b" radius={[4, 4, 0, 0]} />
+                      {outlets.map((o, idx) => (
+                        <Bar key={o.id} dataKey={o.id} name={o.name} fill={COLORS[idx % COLORS.length]} radius={[4, 4, 0, 0]} />
+                      ))}
                     </BarChart>
                   </ResponsiveContainer>
                 )}
@@ -307,7 +319,7 @@ export default function MultiOutletClient() {
                 <table className="w-full">
                   <thead>
                     <tr className="border-b border-border bg-secondary/30">
-                      {['Ingredient', ...OUTLETS.map(o => o.name), 'Reorder Level'].map(h => (
+                      {['Ingredient', ...outlets.map(o => o.name), 'Reorder Level'].map(h => (
                         <th key={h} className="text-left px-5 py-3 text-xs font-semibold text-muted-foreground">{h}</th>
                       ))}
                     </tr>
@@ -316,7 +328,7 @@ export default function MultiOutletClient() {
                     {stockComparison.map(s => (
                       <tr key={s.item} className="hover:bg-secondary/20">
                         <td className="px-5 py-3 text-sm font-medium text-foreground">{s.item}</td>
-                        {OUTLETS.map(outlet => (
+                        {outlets.map(outlet => (
                           <td key={outlet.id} className="px-5 py-3">
                             <span className={`text-sm font-medium ${Number(s[outlet.id]) <= s.reorder ? 'text-red-400' : 'text-foreground'}`}>
                               {Number(s[outlet.id]).toFixed(1)}

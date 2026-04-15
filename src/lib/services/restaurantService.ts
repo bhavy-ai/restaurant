@@ -328,27 +328,72 @@ export const kotService = {
   }, ctx?: RequestContext) {
     const supabase = createClient();
     try {
-      const { data: kotData, error: kotError } = await supabase
-        .from('kots')
-        .insert({
-          kot_number: kot.kotNumber,
-          order_id: kot.orderId || null,
-          table_label: kot.tableLabel,
-          order_type: kot.orderType,
-          station: kot.station,
-          priority: kot.priority,
-          steward: kot.steward,
-          covers: kot.covers,
-          outlet: kot.outlet || 'koramangala',
-          status: 'pending',
-          fire_time: new Date().toISOString(),
-          ...(ctx?.restaurantId ? { restaurant_id: ctx.restaurantId } : {}),
-        })
-        .select()
-        .single();
+      const outletToUse = kot.outlet || 'koramangala';
+      const payload = {
+        kot_number: kot.kotNumber,
+        order_id: kot.orderId || null,
+        table_label: kot.tableLabel,
+        order_type: kot.orderType,
+        station: kot.station,
+        priority: kot.priority,
+        steward: kot.steward,
+        covers: kot.covers,
+        outlet: outletToUse,
+        status: 'pending',
+        fire_time: new Date().toISOString(),
+        ...(ctx?.restaurantId ? { restaurant_id: ctx.restaurantId } : {}),
+      };
+      // Backward compatibility: keep removing missing columns reported by
+      // PostgREST schema-cache errors until insert succeeds or a non-compat
+      // error occurs.
+      let insertPayload: Record<string, any> = { ...payload };
+      let kotData: any = null;
+      let kotError: any = null;
+
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const res = await supabase
+          .from('kots')
+          .insert(insertPayload)
+          .select()
+          .single();
+        kotData = res.data;
+        kotError = res.error;
+        if (!kotError) break;
+
+        // If order_id points to a non-orders row (e.g. takeaway_orders id),
+        // retry with a null order_id to satisfy kots_order_id_fkey.
+        if (kotError?.code === '23503' && /kots_order_id_fkey/i.test(kotError?.message || '')) {
+          insertPayload.order_id = null;
+          continue;
+        }
+
+        // Legacy enum/value compatibility: retry without enum-backed fields
+        // when DB rejects a newer enum value payload.
+        if (kotError?.code === '22P02') {
+          const msg = String(kotError?.message || '').toLowerCase();
+          if (msg.includes('order_type') && 'order_type' in insertPayload) {
+            delete insertPayload.order_type;
+            continue;
+          }
+          if (msg.includes('priority') && 'priority' in insertPayload) {
+            delete insertPayload.priority;
+            continue;
+          }
+          if (msg.includes('status') && 'status' in insertPayload) {
+            delete insertPayload.status;
+            continue;
+          }
+        }
+
+        if (kotError?.code !== 'PGRST204') break;
+
+        const missingColumn = (kotError.message || '').match(/'([^']+)' column/)?.[1];
+        if (!missingColumn || !(missingColumn in insertPayload)) break;
+        delete insertPayload[missingColumn];
+      }
+
       if (kotError) {
-        if (isSchemaError(kotError)) throw kotError;
-        return null;
+        throw kotError;
       }
       const items = kot.items.map((i) => ({
         kot_id: kotData.id,
@@ -388,7 +433,7 @@ function mapKOT(r: any) {
     id: r.id,
     kotNumber: r.kot_number,
     tableLabel: r.table_label,
-    orderType: r.order_type,
+    orderType: r.order_type || r.type || 'dine-in',
     station: r.station,
     status: r.status,
     priority: r.priority,
@@ -407,6 +452,29 @@ function mapKOT(r: any) {
 
 // ── Bills / Payments ──────────────────────────────────────────
 export const billService = {
+  async create(bill: {
+    billNumber: string;
+    orderId?: string;
+    tableLabel: string;
+    covers: number;
+    itemsCount: number;
+    grossAmount: number;
+    discountAmt: number;
+    gstAmount: number;
+    netAmount: number;
+    paymentMode: string;
+    cashTendered?: number;
+    cashChange?: number;
+    splitCash?: number;
+    splitUpi?: number;
+    cashier: string;
+    shiftId?: string;
+    outlet?: string;
+    idempotencyKey?: string;
+  }, ctx?: RequestContext) {
+    return billService.settle(bill, ctx);
+  },
+
   async getByShift(shiftId: string, ctx?: RequestContext) {
     const supabase = createClient();
     try {
@@ -504,9 +572,7 @@ export const billService = {
         }
       }
 
-      const { data, error } = await supabase
-        .from('bills')
-        .insert({
+      let insertPayload: Record<string, any> = {
           bill_number: bill.billNumber,
           order_id: bill.orderId || null,
           table_label: bill.tableLabel,
@@ -527,14 +593,30 @@ export const billService = {
           outlet: bill.outlet || 'koramangala',
           settled_at: new Date().toISOString(),
           ...(ctx?.restaurantId ? { restaurant_id: ctx.restaurantId } : {}),
-        })
-        .select()
-        .single();
-      if (error) {
-        if (isSchemaError(error)) throw error;
-        return null;
+      };
+
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const { data, error } = await supabase
+          .from('bills')
+          .insert(insertPayload)
+          .select()
+          .single();
+        if (!error) {
+          return data;
+        }
+
+        if (error?.code === 'PGRST204') {
+          const missingColumn = (error.message || '').match(/'([^']+)' column/)?.[1];
+          if (missingColumn && missingColumn in insertPayload) {
+            delete insertPayload[missingColumn];
+            continue;
+          }
+        }
+
+        throw error;
       }
-      return data;
+
+      return null;
     } catch (e: any) { console.error('billService.settle:', e.message); throw e; }
   },
 
@@ -670,6 +752,7 @@ export const staffService = {
     phone?: string;
     role: string;
     outlet: string;
+    outlet_id?: string; // New: outlet UUID
   }, ctx?: RequestContext) {
     if (!ctx?.restaurantId) {
       throw new Error('Missing restaurant context for staff creation');
@@ -682,6 +765,7 @@ export const staffService = {
       phone: staff.phone || null,
       role: staff.role,
       outlet: staff.outlet,
+      outlet_id: staff.outlet_id || null,
       status: 'active',
       permissions: [],
       restaurant_id: ctx.restaurantId,
@@ -696,6 +780,7 @@ export const staffService = {
     phone?: string;
     role?: string;
     outlet?: string;
+    outlet_id?: string; // New: outlet UUID
   }) {
     const supabase = createClient();
     const { error } = await supabase.from('staff_users').update(updates).eq('id', id);
@@ -724,6 +809,7 @@ function mapStaffUser(r: any) {
     email: r.email,
     role: r.role,
     outlet: r.outlet,
+    outlet_id: r.outlet_id || '',
     status: r.status,
     lastLogin: r.last_login || 'Never',
     permissions: r.permissions || [],
@@ -777,7 +863,7 @@ export const auditService = {
     outlet?: string;
   }, ctx?: RequestContext) {
     const supabase = createClient();
-    const { error } = await supabase.from('audit_logs').insert({
+    let payload: Record<string, any> = {
       staff_name: entry.staffName,
       staff_role: entry.staffRole || null,
       action: entry.action,
@@ -787,8 +873,29 @@ export const auditService = {
       severity: entry.severity || 'info',
       outlet: entry.outlet || 'koramangala',
       ...(ctx?.restaurantId ? { restaurant_id: ctx.restaurantId } : {}),
-    });
-    if (error && isSchemaError(error)) throw error;
+    };
+
+    // Audit logging should never break user flows. Retry by stripping unknown
+    // columns reported by PostgREST schema cache, then fail-open.
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const { error } = await supabase.from('audit_logs').insert(payload);
+      if (!error) return;
+
+      if (error?.code === 'PGRST204') {
+        const missingColumn = (error.message || '').match(/'([^']+)' column/)?.[1];
+        if (missingColumn && missingColumn in payload) {
+          delete payload[missingColumn];
+          continue;
+        }
+      }
+
+      if (isSchemaError(error)) {
+        console.warn('auditService.log schema fallback:', error.message);
+      } else {
+        console.warn('auditService.log failed (non-blocking):', error.message || error);
+      }
+      return;
+    }
   },
 };
 
@@ -806,8 +913,7 @@ export const shiftService = {
         .limit(1)
         .maybeSingle();
       if (ctx?.restaurantId) {
-        // Note: maybeSingle() returns a single row, so we apply restaurant_id before
-        // This is handled by the query builder chain
+        query = query.eq('restaurant_id', ctx.restaurantId);
       }
       const { data, error } = await query;
       if (error) {

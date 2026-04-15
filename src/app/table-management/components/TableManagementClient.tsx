@@ -60,6 +60,10 @@ const statusConfig: Record<TableStatus, { label: string; bg: string; border: str
   cleaning:       { label: 'Cleaning',    bg: 'bg-muted',           border: 'border-border',          text: 'text-muted-foreground',  dot: 'bg-muted-foreground' },
 };
 
+function getDraftKey(restaurantId?: string, outletSlug?: string, tableId?: string) {
+  return restaurantId && tableId ? `restro_table_draft_${restaurantId}_${outletSlug || 'default'}_${tableId}` : null;
+}
+
 function getSeatedDuration(seatedAt?: string): string {
   if (!seatedAt) return '';
   const mins = Math.floor((Date.now() - new Date(seatedAt).getTime()) / 60000);
@@ -79,7 +83,7 @@ export default function TableManagementClient() {
   const supabase = createClient();
   const networkStatus = useNetworkStatus();
   const { isOnline } = networkStatus;
-  const { staffUser, activeRestaurant } = useAuth();
+  const { staffUser, activeRestaurant, activeOutlet } = useAuth();
 
   // ── Core state ────────────────────────────────────────────────────────
   const [tables, setTables] = useState<TableData[]>([]);
@@ -153,6 +157,7 @@ export default function TableManagementClient() {
   const [showDeleteTableModal, setShowDeleteTableModal] = useState(false);
   const [deleteTableTarget, setDeleteTableTarget] = useState<TableData | null>(null);
   const [deleteTableLoading, setDeleteTableLoading] = useState(false);
+  const draftHydratedRef = useRef<string | null>(null);
 
   // ── Role check: can manage tables (edit/delete) ───────────────────────
   const canManageTables = staffUser
@@ -161,15 +166,61 @@ export default function TableManagementClient() {
 
   // Derived: always read selectedTable from tables array so it's always fresh
   const selectedTable = tables.find((t) => t.id === selectedTableId) ?? null;
+  const selectedTableHasNoOrderHistory = Boolean(
+    selectedTable &&
+    selectedTable.status === 'occupied' &&
+    !kotHistoryLoading &&
+    kotHistoryTableId === selectedTable.id &&
+    kotHistory.length === 0 &&
+    ((selectedTable.kotCount ?? 0) === 0)
+  );
 
-  // ── Clear cart when switching tables ─────────────────────────────────
+  // ── Restore cart draft for the selected table ────────────────────────
   useEffect(() => {
-    setCart([]);
-    setShowOrderPanel(false);
-  }, [selectedTableId]);
+    const draftKey = getDraftKey(activeRestaurant?.id, activeOutlet?.slug, selectedTableId || undefined);
+    draftHydratedRef.current = null;
+
+    if (!draftKey || !selectedTableId) {
+      setCart([]);
+      setShowOrderPanel(false);
+      return;
+    }
+
+    try {
+      const raw = localStorage.getItem(draftKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        setCart(Array.isArray(parsed?.cart) ? parsed.cart : []);
+        setShowOrderPanel(Boolean(parsed?.showOrderPanel));
+      } else {
+        setCart([]);
+        setShowOrderPanel(false);
+      }
+    } catch {
+      setCart([]);
+      setShowOrderPanel(false);
+    } finally {
+      draftHydratedRef.current = draftKey;
+    }
+  }, [activeRestaurant?.id, activeOutlet?.slug, selectedTableId]);
+
+  useEffect(() => {
+    const draftKey = getDraftKey(activeRestaurant?.id, activeOutlet?.slug, selectedTableId || undefined);
+    if (!draftKey || draftHydratedRef.current !== draftKey) return;
+    try {
+      localStorage.setItem(draftKey, JSON.stringify({ cart, showOrderPanel }));
+    } catch {
+      // Non-blocking
+    }
+  }, [activeRestaurant?.id, activeOutlet?.slug, selectedTableId, cart, showOrderPanel]);
 
   // ── Load KOT history when selected table changes ──────────────────────
   useEffect(() => {
+    if (!activeRestaurant?.id) {
+      setKotHistory([]);
+      setKotHistoryTableId(null);
+      return;
+    }
     if (!selectedTable || selectedTable.status === 'available' || selectedTable.status === 'cleaning') {
       setKotHistory([]);
       setKotHistoryTableId(null);
@@ -181,6 +232,7 @@ export default function TableManagementClient() {
       .from('kots')
       .select('id, kot_number, fire_time, kot_items(id, name, qty, is_veg, menu_item_id)')
       .eq('table_label', selectedTable.label)
+      .eq('restaurant_id', activeRestaurant.id)
       .neq('status', 'voided')
       .order('fire_time', { ascending: true })
       .then(({ data, error }) => {
@@ -203,7 +255,7 @@ export default function TableManagementClient() {
         }
         setKotHistoryLoading(false);
       });
-  }, [selectedTable?.id, selectedTable?.label, selectedTable?.status, selectedTable?.kotCount]);
+  }, [activeRestaurant?.id, selectedTable?.id, selectedTable?.label, selectedTable?.status, selectedTable?.kotCount]);
 
   // Refresh KOT history after a new KOT is fired
   const refreshKotHistory = useCallback(async (tableLabel: string, tableId: string) => {
@@ -211,6 +263,7 @@ export default function TableManagementClient() {
       .from('kots')
       .select('id, kot_number, fire_time, kot_items(id, name, qty, is_veg, menu_item_id)')
       .eq('table_label', tableLabel)
+      .eq('restaurant_id', activeRestaurant?.id)
       .neq('status', 'voided')
       .order('fire_time', { ascending: true });
     if (!error && data) {
@@ -234,17 +287,27 @@ export default function TableManagementClient() {
 
   // Broadcast table status to KDS + POS ──────────────────────────────
   const broadcastTableStatus = useCallback((tableId: string, label: string, status: TableStatus, captain?: string, covers?: number) => {
-    supabase.channel('table_status_sync').send({
+    const message = {
       type: 'broadcast',
       event: 'table_status_changed',
       payload: { tableId, label, status, captain, covers, updatedAt: new Date().toISOString() },
-    }).catch(() => {/* non-blocking */});
+    };
+    const channel = supabase.channel('table_status_sync') as any;
+    const sendPromise = typeof channel.httpSend === 'function'
+      ? channel.httpSend(message)
+      : channel.send(message);
+    Promise.resolve(sendPromise).catch(() => {/* non-blocking */});
   }, [supabase]);
 
   // ── Load tables ───────────────────────────────────────────────────────
   const loadTables = useCallback(async () => {
+    if (!activeRestaurant?.id) {
+      setTables([]);
+      setLoading(false);
+      return;
+    }
     try {
-      const data = await tableService.getAll();
+      const data = await tableService.getAll(activeOutlet?.slug || 'koramangala', { restaurantId: activeRestaurant.id, outletSlug: activeOutlet?.slug });
       setTables(data as TableData[]);
       if (data.length > 0 && !selectedTableId) {
         setSelectedTableId((data[0] as TableData).id);
@@ -254,7 +317,7 @@ export default function TableManagementClient() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [activeRestaurant?.id, activeOutlet?.slug, selectedTableId]);
 
   useEffect(() => { loadTables(); }, [loadTables]);
 
@@ -305,9 +368,10 @@ export default function TableManagementClient() {
   // ── Load menu items for order panel ──────────────────────────────────
   async function loadMenuItems() {
     if (menuItems.length > 0) return;
+    if (!activeRestaurant?.id) return;
     setMenuLoading(true);
     try {
-      const data = await menuService.getAll();
+      const data = await menuService.getAll(activeOutlet?.slug || 'koramangala', { restaurantId: activeRestaurant.id, outletSlug: activeOutlet?.slug });
       setMenuItems(data.filter((m: MenuItem) => m.available));
     } catch (err: any) {
       toast.error('Failed to load menu: ' + err.message);
@@ -357,15 +421,58 @@ export default function TableManagementClient() {
     try {
       const { data, error } = await supabase
         .from('staff_users')
-        .select('id, name, role')
-        .in('role', ['owner', 'manager', 'captain'])
-        .eq('status', 'active')
-        .order('name', { ascending: true });
-      if (!error && data) {
-        setCaptainList(data);
+        .select('*');
+
+      if (error) throw error;
+
+      const allowedRoles = new Set(['owner', 'manager', 'captain', 'outlet_manager']);
+      const normalized = (data || [])
+        .filter((row: any) => {
+          const role = String(row.role ?? row.staff_role ?? '').toLowerCase();
+          const status = String(row.status ?? row.staff_status ?? '').toLowerCase();
+          const statusActive = status ? status === 'active' : true;
+          const flagActive = row.is_active === undefined ? true : Boolean(row.is_active);
+          return allowedRoles.has(role) && statusActive && flagActive;
+        })
+        .map((row: any, idx: number) => ({
+          id: String(row.id ?? row.user_id ?? `${row.name || row.full_name || 'staff'}-${idx}`),
+          name: String(row.name ?? row.full_name ?? row.staff_name ?? 'Unnamed Staff'),
+          role: String(row.role ?? row.staff_role ?? 'captain'),
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      if (normalized.length > 0) {
+        setCaptainList(normalized);
+        return;
       }
+
+      const fallbackNames = Array.from(new Set([
+        ...CAPTAINS,
+        ...tables.map((t) => t.captain).filter(Boolean) as string[],
+        staffUser?.name || '',
+      ].map((n) => String(n).trim()).filter(Boolean)));
+
+      setCaptainList(
+        fallbackNames.map((name, idx) => ({
+          id: `fallback-${idx}`,
+          name,
+          role: 'captain',
+        }))
+      );
     } catch {
-      // non-blocking — dropdown will just be empty
+      const fallbackNames = Array.from(new Set([
+        ...CAPTAINS,
+        ...tables.map((t) => t.captain).filter(Boolean) as string[],
+        staffUser?.name || '',
+      ].map((n) => String(n).trim()).filter(Boolean)));
+
+      setCaptainList(
+        fallbackNames.map((name, idx) => ({
+          id: `fallback-${idx}`,
+          name,
+          role: 'captain',
+        }))
+      );
     }
   }
 
@@ -435,8 +542,11 @@ export default function TableManagementClient() {
     const table = tables.find((t) => t.id === tableId);
     if (!table) return;
 
+    const hasLoadedHistory = kotHistoryTableId === tableId && kotHistory.length > 0;
+    const hasAnyOrders = hasLoadedHistory || (table.kotCount ?? 0) > 0;
+
     // Edge case: can't request bill if no KOTs have been fired
-    if (!table.kotCount || table.kotCount === 0) {
+    if (!hasAnyOrders) {
       toast.error('No orders placed yet — add items before requesting bill');
       return;
     }
@@ -497,13 +607,20 @@ export default function TableManagementClient() {
     }
   }
 
-  async function markAvailable(tableId: string) {
+  async function markAvailable(tableId: string, allowNoOrdersFromOccupied = false) {
     const table = tables.find((t) => t.id === tableId);
 
-    // Edge case: only allow marking available from cleaning state
+    // Standard rule: only cleaning -> available.
+    // Exception: occupied table with no order history can be released directly.
     if (table && table.status !== 'cleaning') {
-      toast.error('Table must be in cleaning state before marking available');
-      return;
+      const canReleaseNoOrders = allowNoOrdersFromOccupied
+        && table.status === 'occupied'
+        && selectedTable?.id === tableId
+        && selectedTableHasNoOrderHistory;
+      if (!canReleaseNoOrders) {
+        toast.error('Table must be in cleaning state before marking available');
+        return;
+      }
     }
 
     setTables((prev) => prev.map((t) => t.id === tableId ? { ...t, status: 'available', covers: undefined, captain: undefined, seatedAt: undefined, runningAmount: undefined } : t));
@@ -551,6 +668,15 @@ export default function TableManagementClient() {
     setCart([]);
     setMenuSearch('');
     setMenuCategory('All');
+
+    const draftKey = getDraftKey(activeRestaurant?.id, activeOutlet?.slug, selectedTableId || undefined);
+    if (draftKey) {
+      try {
+        localStorage.removeItem(draftKey);
+      } catch {
+        // Non-blocking
+      }
+    }
   }
 
   // Fire KOT for the table
@@ -593,7 +719,7 @@ export default function TableManagementClient() {
         steward: selectedTable.captain ?? 'Captain',
         covers: selectedTable.covers ?? 2,
         items: cart.map((c) => ({ menuItemId: c.menuItemId, name: c.name, qty: c.qty, isVeg: c.isVeg })),
-      });
+      }, activeRestaurant?.id ? { restaurantId: activeRestaurant.id, outletSlug: activeOutlet?.slug } : undefined);
       // Update running amount
       const { total } = calcCartTotal(cart);
       let newRunning = (selectedTable.runningAmount ?? 0) + total;
@@ -606,6 +732,15 @@ export default function TableManagementClient() {
       await refreshKotHistory(selectedTable.label, selectedTable.id);
       clearCart();
       setShowOrderPanel(false);
+
+      const draftKey = getDraftKey(activeRestaurant?.id, activeOutlet?.slug, selectedTable.id);
+      if (draftKey) {
+        try {
+          localStorage.removeItem(draftKey);
+        } catch {
+          // Non-blocking
+        }
+      }
     } catch (err: any) {
       toast.error('Failed to fire KOT: ' + err.message);
     } finally {
@@ -687,6 +822,7 @@ export default function TableManagementClient() {
         .from('kots')
         .select('id, kot_items(qty, menu_item_id)')
         .eq('table_label', selectedTable.label)
+        .eq('restaurant_id', activeRestaurant?.id)
         .not('status', 'in', '("voided")');
 
       if (allKots) {
@@ -786,6 +922,7 @@ export default function TableManagementClient() {
         .from('kots')
         .select('id, kot_items(qty, menu_item_id)')
         .eq('table_label', selectedTable.label)
+        .eq('restaurant_id', activeRestaurant?.id)
         .not('status', 'in', '("voided")');
 
       if (allKots) {
@@ -1243,12 +1380,26 @@ export default function TableManagementClient() {
 
                   {/* Assign / Change Captain */}
                   <button
-                    onClick={() => { setAssignCaptain(selectedTable.captain ?? ''); setShowAssignModal(true); }}
+                    onClick={() => {
+                      setAssignCaptain(selectedTable.captain ?? '');
+                      loadCaptainList();
+                      setShowAssignModal(true);
+                    }}
                     className="w-full flex items-center gap-2 px-4 py-3 bg-secondary border border-border text-foreground font-semibold text-sm rounded-xl hover:border-primary/40 transition-all"
                   >
                     <UserCheck size={15} />
                     {selectedTable.captain ? `Change Captain (${selectedTable.captain})` : 'Assign Captain'}
                   </button>
+
+                  {selectedTableHasNoOrderHistory && (
+                    <button
+                      onClick={() => markAvailable(selectedTable.id, true)}
+                      className="w-full flex items-center gap-2 px-4 py-3 bg-accent/15 border border-accent/30 text-accent font-bold text-sm rounded-xl transition-all active:scale-95"
+                    >
+                      <CheckCircle size={15} />
+                      Mark Available (No Orders)
+                    </button>
+                  )}
                 </>
               )}
 
@@ -1804,6 +1955,63 @@ export default function TableManagementClient() {
               >
                 {seatLoading ? <Loader2 size={14} className="animate-spin" /> : <Utensils size={14} />}
                 Seat Table
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════
+          MODAL: Assign Captain
+      ══════════════════════════════════════════════════════════════════ */}
+      {showAssignModal && selectedTable && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-end sm:items-center justify-center z-50">
+          <div className="bg-card border border-border rounded-t-2xl sm:rounded-2xl w-full max-w-sm mx-0 sm:mx-4 p-5">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h3 className="text-base font-bold text-foreground">Assign Captain</h3>
+                <p className="text-xs text-muted-foreground mt-0.5">{selectedTable.label}</p>
+              </div>
+              <button onClick={() => setShowAssignModal(false)} className="text-muted-foreground hover:text-foreground">
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="space-y-4 mb-5">
+              <div>
+                <label className="text-xs text-muted-foreground font-medium block mb-1.5">
+                  Captain Name <span className="text-destructive">*</span>
+                </label>
+                <select
+                  value={assignCaptain}
+                  onChange={(e) => setAssignCaptain(e.target.value)}
+                  className="w-full px-3 py-2.5 bg-secondary border border-border rounded-xl text-sm text-foreground focus:outline-none focus:border-primary/50"
+                  required
+                >
+                  <option value="">— Select Captain —</option>
+                  {captainList.map((s) => (
+                    <option key={`assign-${s.id}`} value={s.name}>
+                      {s.name} ({s.role})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="flex gap-2">
+              <button
+                onClick={() => setShowAssignModal(false)}
+                className="flex-1 py-2.5 bg-secondary border border-border rounded-xl text-sm font-semibold text-foreground"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmAssignCaptain}
+                disabled={!assignCaptain.trim() || assignLoading}
+                className="flex-1 py-2.5 bg-accent hover:bg-accent/90 disabled:opacity-40 rounded-xl text-sm font-bold text-white flex items-center justify-center gap-2 transition-all"
+              >
+                {assignLoading ? <Loader2 size={14} className="animate-spin" /> : <UserCheck size={14} />}
+                Assign
               </button>
             </div>
           </div>

@@ -4,6 +4,7 @@ import { createClient } from '@/lib/supabase/client';
 import { toast } from 'sonner';
 import { Users, Plus, Search, Phone, Mail, ShoppingBag, Edit3, X, Save, Tag, AlertCircle } from 'lucide-react';
 import { captureException } from '@/lib/errorTracking';
+import { useAuth } from '@/contexts/AuthContext';
 
 interface Customer {
   id: string;
@@ -52,6 +53,9 @@ function validateForm(form: typeof defaultForm): FormErrors {
 
 export default function CustomerClient() {
   const supabase = createClient();
+  const { activeRestaurant, activeOutlet } = useAuth();
+  const restaurantId = activeRestaurant?.id;
+  const outletSlug = activeOutlet?.slug || 'koramangala';
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -67,10 +71,20 @@ export default function CustomerClient() {
   const [saving, setSaving] = useState(false);
 
   const loadCustomers = useCallback(async () => {
+    if (!restaurantId) {
+      setCustomers([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setLoadError(null);
     try {
-      const { data, error } = await supabase.from('customers').select('*').eq('outlet', 'koramangala').order('total_spent', { ascending: false });
+      const { data, error } = await supabase
+        .from('customers')
+        .select('*')
+        .eq('restaurant_id', restaurantId)
+        .eq('outlet', outletSlug)
+        .order('total_spent', { ascending: false });
       if (error) throw error;
       setCustomers((data || []).map((r: any) => ({
         id: r.id, name: r.name, phone: r.phone || '', email: r.email || '',
@@ -84,7 +98,7 @@ export default function CustomerClient() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [restaurantId, outletSlug]);
 
   useEffect(() => { loadCustomers(); }, [loadCustomers]);
 
@@ -135,6 +149,10 @@ export default function CustomerClient() {
   };
 
   const saveCustomer = async () => {
+    if (!restaurantId) {
+      toast.error('No active restaurant selected');
+      return;
+    }
     // Mark all fields as touched and validate
     setTouched({ name: true, phone: true, email: true });
     const errors = validateForm(form);
@@ -147,7 +165,8 @@ export default function CustomerClient() {
         name: form.name.trim(), phone: form.phone.trim() || null, email: form.email.trim() || null,
         address: form.address.trim() || null, notes: form.notes.trim() || null,
         tags: form.tags.split(',').map(t => t.trim()).filter(Boolean),
-        outlet: 'koramangala',
+        restaurant_id: restaurantId,
+        outlet: outletSlug,
       };
       if (editingCustomer) {
         const { error } = await supabase.from('customers').update({ ...payload, updated_at: new Date().toISOString() }).eq('id', editingCustomer.id);

@@ -59,11 +59,18 @@ export default function InventoryClient() {
   const [lastAlertSent, setLastAlertSent] = useState<Date | null>(null);
 
   const supabase = createClient();
-  const { staffUser } = useAuth();
+  const { staffUser, activeRestaurant, activeOutlet } = useAuth();
+  const restaurantId = activeRestaurant?.id;
+  const outletSlug = activeOutlet?.slug || staffUser?.outlet || 'koramangala';
 
   const loadInventory = useCallback(async () => {
+    if (!restaurantId) {
+      setItems([]);
+      setLoading(false);
+      return;
+    }
     try {
-      const data = await inventoryService.getAll();
+      const data = await inventoryService.getAll(outletSlug, { restaurantId, outletSlug });
       setItems(data);
     } catch (err: any) {
       captureException(err, { component: 'InventoryClient', action: 'loadInventory' });
@@ -71,7 +78,7 @@ export default function InventoryClient() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [restaurantId, outletSlug]);
 
   useEffect(() => {
     loadInventory();
@@ -180,7 +187,9 @@ export default function InventoryClient() {
         adjustModal.type,
         qty,
         adjustModal.reason,
-        staffUser?.name || 'Staff'
+        staffUser?.name || 'Staff',
+        outletSlug,
+        { restaurantId: restaurantId || '', outletSlug }
       );
       toast.success(
         `Stock adjusted — ${itemName}: ${adjustModal.type === 'add' ? '+' : '-'}${adjustModal.qty} ${itemUnit}`
@@ -193,8 +202,8 @@ export default function InventoryClient() {
         entity: itemName,
         details: `Type: ${adjustModal.type} | Qty: ${adjustModal.type === 'add' ? '+' : '-'}${qty} ${itemUnit} | Reason: ${adjustModal.reason}`,
         severity: adjustModal.type === 'wastage' ? 'warning' : 'info',
-        outlet: staffUser?.outlet || 'koramangala',
-      }).catch(() => {/* non-blocking */});
+        outlet: outletSlug,
+      }, { restaurantId: restaurantId || '', outletSlug }).catch(() => {/* non-blocking */});
     } catch (err: any) {
       toast.error('Adjustment failed: ' + err.message);
       await offlineQueue.enqueue('inventory_adjust', {
@@ -244,7 +253,8 @@ export default function InventoryClient() {
             unit: i.unit,
             status: i.status,
           })),
-          outlet: 'koramangala',
+          outlet: outletSlug,
+          restaurantId,
         }),
       });
       const result = await res.json();

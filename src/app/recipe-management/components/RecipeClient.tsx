@@ -4,6 +4,7 @@ import { createClient } from '@/lib/supabase/client';
 import { toast } from 'sonner';
 import { FlaskConical, Plus, Trash2, Save, ChevronDown, ChevronUp, AlertTriangle, Package } from 'lucide-react';
 import { captureException } from '@/lib/errorTracking';
+import { useAuth } from '@/contexts/AuthContext';
 
 interface Ingredient {
   id: string;
@@ -33,6 +34,9 @@ interface RecipeMap {
 
 export default function RecipeClient() {
   const supabase = createClient();
+  const { activeRestaurant, activeOutlet } = useAuth();
+  const restaurantId = activeRestaurant?.id;
+  const outletSlug = activeOutlet?.slug || 'koramangala';
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
   const [menuItems, setMenuItems] = useState<MenuItem[]>([]);
   const [recipes, setRecipes] = useState<RecipeMap>({});
@@ -47,13 +51,20 @@ export default function RecipeClient() {
   const [savingIng, setSavingIng] = useState(false);
 
   const loadData = useCallback(async () => {
+    if (!restaurantId) {
+      setIngredients([]);
+      setMenuItems([]);
+      setRecipes({});
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setLoadError(null);
     try {
       const [ingRes, menuRes, recipeRes] = await Promise.all([
-        supabase.from('ingredients').select('*').eq('outlet', 'koramangala').order('name'),
-        supabase.from('menu_items').select('id,name,category').eq('outlet', 'koramangala').order('category').order('name'),
-        supabase.from('recipes').select('*, ingredients(name,unit)'),
+        supabase.from('ingredients').select('*').eq('restaurant_id', restaurantId).eq('outlet', outletSlug).order('name'),
+        supabase.from('menu_items').select('id,name,category').eq('restaurant_id', restaurantId).eq('outlet', outletSlug).order('category').order('name'),
+        supabase.from('recipes').select('*, ingredients(name,unit), menu_items!inner(id, restaurant_id, outlet)').eq('menu_items.restaurant_id', restaurantId).eq('menu_items.outlet', outletSlug),
       ]);
 
       setIngredients((ingRes.data || []).map((r: any) => ({
@@ -81,16 +92,21 @@ export default function RecipeClient() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [restaurantId, outletSlug]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
   const addIngredient = async () => {
+    if (!restaurantId) {
+      toast.error('No active restaurant selected');
+      return;
+    }
     if (!ingForm.name.trim()) return;
     setSavingIng(true);
     try {
       const { error } = await supabase.from('ingredients').insert({
-        outlet: 'koramangala',
+        restaurant_id: restaurantId,
+        outlet: outletSlug,
         name: ingForm.name.trim(),
         unit: ingForm.unit,
         current_stock: Number(ingForm.currentStock) || 0,
@@ -209,8 +225,16 @@ export default function RecipeClient() {
           </h1>
           <p className="text-sm text-muted-foreground mt-0.5">Map ingredients to menu items for automatic stock deduction on sale</p>
         </div>
-        <button onClick={() => setShowAddIngredient(true)} className="flex items-center gap-2 px-3 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90">
-          <Plus size={15} /> Add Ingredient
+      </div>
+
+      <div className="bg-card border border-border rounded-xl p-4">
+        <p className="text-sm font-medium text-foreground">How this works</p>
+        <p className="text-xs text-muted-foreground mt-1">
+          Ingredients are your stock master (paneer, tomato, oil). Recipes are consumption rules per menu item (for 1 dish, how much stock to deduct).
+        </p>
+        <p className="text-xs text-muted-foreground mt-2">Menu items are managed from Admin Panel > Menu & Pricing. Recipe mapping is edited per menu item below.</p>
+        <button onClick={() => setShowAddIngredient(true)} className="mt-3 px-3 py-1.5 bg-secondary border border-border rounded-lg text-xs text-foreground hover:bg-secondary/80">
+          Manage Ingredients
         </button>
       </div>
 
@@ -237,6 +261,7 @@ export default function RecipeClient() {
         <div className="col-span-2 bg-card border border-border rounded-xl overflow-hidden">
           <div className="px-4 py-3 border-b border-border flex items-center justify-between">
             <h2 className="text-sm font-semibold text-foreground flex items-center gap-2"><Package size={15} className="text-primary" /> Ingredients Stock</h2>
+            <button onClick={() => setShowAddIngredient(true)} className="text-xs text-primary hover:underline">Add Ingredient</button>
           </div>
           <div className="divide-y divide-border max-h-[500px] overflow-y-auto">
             {ingredients.length === 0 ? (
@@ -267,7 +292,7 @@ export default function RecipeClient() {
             <div className="bg-card border border-border rounded-xl flex flex-col items-center justify-center py-16 text-center">
               <FlaskConical size={28} className="text-muted-foreground mb-2" />
               <p className="text-sm font-medium text-foreground mb-1">No menu items found</p>
-              <p className="text-xs text-muted-foreground">Add menu items in the Admin Panel to map recipes</p>
+              <p className="text-xs text-muted-foreground">Add menu items from Admin Panel > Menu & Pricing, then map ingredients here.</p>
             </div>
           ) : (
             Object.entries(grouped).map(([category, items]) => (
@@ -368,6 +393,7 @@ export default function RecipeClient() {
           </div>
         </div>
       )}
+
     </div>
   );
 }

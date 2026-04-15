@@ -3,6 +3,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { toast } from 'sonner';
 import { Bike, RefreshCw, CheckCircle, XCircle, AlertTriangle, Loader2, Zap, Phone, MapPin } from 'lucide-react';
+import { useAuth } from '@/contexts/AuthContext';
 
 type OrderStatus = 'pending' | 'confirmed' | 'preparing' | 'ready' | 'dispatched' | 'delivered' | 'cancelled';
 
@@ -48,6 +49,9 @@ const AGGREGATOR_COLORS: Record<string, string> = {
 
 export default function AggregatorOrdersClient() {
   const supabase = createClient();
+  const { activeRestaurant, activeOutlet } = useAuth();
+  const restaurantId = activeRestaurant?.id;
+  const outletSlug = activeOutlet?.slug || 'koramangala';
   const [orders, setOrders] = useState<AggregatorOrder[]>([]);
   const [configs, setConfigs] = useState<AggregatorConfig[]>([]);
   const [loading, setLoading] = useState(true);
@@ -56,11 +60,17 @@ export default function AggregatorOrdersClient() {
   const [updatingId, setUpdatingId] = useState<string | null>(null);
 
   const loadOrders = useCallback(async () => {
+    if (!restaurantId) {
+      setOrders([]);
+      setLoading(false);
+      return;
+    }
     try {
       const { data, error } = await supabase
         .from('takeaway_orders')
         .select('*')
-        .eq('outlet', 'koramangala')
+        .eq('restaurant_id', restaurantId)
+        .eq('outlet', outletSlug)
         .eq('order_type', 'aggregator')
         .order('created_at', { ascending: false })
         .limit(50);
@@ -83,14 +93,19 @@ export default function AggregatorOrdersClient() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [restaurantId, outletSlug]);
 
   const loadConfigs = useCallback(async () => {
+    if (!restaurantId) {
+      setConfigs([]);
+      return;
+    }
     try {
       const { data } = await supabase
         .from('aggregator_config')
         .select('*')
-        .eq('outlet', 'koramangala');
+        .eq('outlet', outletSlug)
+        .eq('restaurant_id', restaurantId);
       setConfigs((data || []).map((r: any) => ({
         id: r.id,
         platform: r.platform,
@@ -104,7 +119,7 @@ export default function AggregatorOrdersClient() {
     } catch {
       // non-critical
     }
-  }, []);
+  }, [restaurantId, outletSlug]);
 
   useEffect(() => {
     loadOrders();
@@ -116,7 +131,11 @@ export default function AggregatorOrdersClient() {
     const channel = supabase
       .channel('aggregator_orders')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'takeaway_orders' }, (payload) => {
-        if (payload.new.order_type === 'aggregator') {
+        if (
+          payload.new.order_type === 'aggregator' &&
+          payload.new.restaurant_id === restaurantId &&
+          payload.new.outlet === outletSlug
+        ) {
           const r = payload.new;
           setOrders((prev) => [{
             id: r.id,
@@ -135,13 +154,17 @@ export default function AggregatorOrdersClient() {
         }
       })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'takeaway_orders' }, (payload) => {
-        if (payload.new.order_type === 'aggregator') {
+        if (
+          payload.new.order_type === 'aggregator' &&
+          payload.new.restaurant_id === restaurantId &&
+          payload.new.outlet === outletSlug
+        ) {
           setOrders((prev) => prev.map((o) => o.id === payload.new.id ? { ...o, status: payload.new.status } : o));
         }
       })
       .subscribe();
     return () => { supabase.removeChannel(channel); };
-  }, []);
+  }, [restaurantId, outletSlug]);
 
   async function pollOrders() {
     setPolling(true);

@@ -8,6 +8,7 @@
 CREATE TABLE IF NOT EXISTS public.gst_config (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   outlet TEXT NOT NULL DEFAULT 'koramangala',
+  restaurant_id UUID REFERENCES public.restaurants(id) ON DELETE CASCADE,
   gstin TEXT NOT NULL DEFAULT '',
   legal_name TEXT NOT NULL DEFAULT '',
   trade_name TEXT NOT NULL DEFAULT '',
@@ -26,6 +27,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_gst_config_outlet ON public.gst_config(out
 CREATE TABLE IF NOT EXISTS public.outlet_settings (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   outlet TEXT NOT NULL DEFAULT 'koramangala',
+  restaurant_id UUID REFERENCES public.restaurants(id) ON DELETE CASCADE,
   name TEXT NOT NULL DEFAULT '',
   gstin TEXT NOT NULL DEFAULT '',
   fssai TEXT NOT NULL DEFAULT '',
@@ -73,12 +75,12 @@ CREATE POLICY "open_access_outlet_settings" ON public.outlet_settings FOR ALL TO
 -- ── 7. Seed default data ──────────────────────────────────────
 DO $$
 BEGIN
-  INSERT INTO public.gst_config (outlet, gstin, legal_name, trade_name, registration_type, rate_5_enabled, rate_12_enabled, rate_18_enabled, rate_0_enabled)
-  VALUES ('koramangala', '29AABCS1429B1Z1', 'Spice Garden Foods Pvt Ltd', 'Spice Garden', 'Regular', true, true, false, false)
+  INSERT INTO public.gst_config (outlet, restaurant_id, gstin, legal_name, trade_name, registration_type, rate_5_enabled, rate_12_enabled, rate_18_enabled, rate_0_enabled)
+  VALUES ('koramangala', (SELECT id FROM public.restaurants ORDER BY created_at ASC LIMIT 1), '29AABCS1429B1Z1', 'Spice Garden Foods Pvt Ltd', 'Spice Garden', 'Regular', true, true, false, false)
   ON CONFLICT (outlet) DO NOTHING;
 
-  INSERT INTO public.outlet_settings (outlet, name, gstin, fssai, address, phone, email, upi_id, bill_prefix, kot_prefix, print_copies, service_charge_enabled, service_charge_pct)
-  VALUES ('koramangala', 'Spice Garden — Koramangala', '29AABCS1429B1Z1', '11222333444455',
+  INSERT INTO public.outlet_settings (outlet, restaurant_id, name, gstin, fssai, address, phone, email, upi_id, bill_prefix, kot_prefix, print_copies, service_charge_enabled, service_charge_pct)
+  VALUES ('koramangala', (SELECT id FROM public.restaurants ORDER BY created_at ASC LIMIT 1), 'Spice Garden — Koramangala', '29AABCS1429B1Z1', '11222333444455',
           '42, 5th Cross, Koramangala 4th Block, Bengaluru — 560034',
           '+91 98765 43210', 'koramangala@spicegarden.in', 'spicegarden@kotak',
           'B', 'K', 2, false, 10)

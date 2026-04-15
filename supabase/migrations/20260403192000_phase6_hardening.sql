@@ -46,8 +46,22 @@ CREATE INDEX IF NOT EXISTS idx_inventory_restaurant_outlet
   ON public.inventory_items(restaurant_id, outlet);
 
 -- staff_users
-CREATE INDEX IF NOT EXISTS idx_staff_restaurant
-  ON public.staff_users(restaurant_id, role);
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'staff_users' AND column_name = 'role'
+  ) THEN
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_staff_restaurant_role ON public.staff_users(restaurant_id, role)';
+  ELSIF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'staff_users' AND column_name = 'staff_role'
+  ) THEN
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_staff_restaurant_staff_role ON public.staff_users(restaurant_id, staff_role)';
+  ELSE
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_staff_restaurant_only ON public.staff_users(restaurant_id)';
+  END IF;
+END $$;
 
 -- audit_logs
 CREATE INDEX IF NOT EXISTS idx_audit_restaurant_outlet_date

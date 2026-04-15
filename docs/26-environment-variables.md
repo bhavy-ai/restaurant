@@ -34,6 +34,11 @@ All environment variables are stored in `.env` at the project root.
 |---|---|---|
 | `NEXT_PUBLIC_SITE_URL` | Application base URL | ✅ Set to production URL |
 
+### Supabase Server
+| Variable | Description | Status |
+|---|---|---|
+| `SUPABASE_SERVICE_ROLE_KEY` | Server-only Supabase key for admin flows and privileged writes | ⚠️ Required for superadmin restaurant creation |
+
 ### Optional (AI / Analytics)
 | Variable | Description |
 |---|---|

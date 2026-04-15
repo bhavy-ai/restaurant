@@ -4,6 +4,7 @@ import { createClient } from '@/lib/supabase/client';
 import { toast } from 'sonner';
 import { captureException } from '@/lib/errorTracking';
 import { Tag, Plus, Edit3, Trash2, X, Save, Clock, Percent, IndianRupee, ToggleLeft, ToggleRight, AlertCircle } from 'lucide-react';
+import { useAuth } from '@/contexts/AuthContext';
 
 interface Discount {
   id: string;
@@ -34,6 +35,9 @@ const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 export default function DiscountsClient() {
   const supabase = createClient();
+  const { activeRestaurant, activeOutlet } = useAuth();
+  const restaurantId = activeRestaurant?.id;
+  const outletSlug = activeOutlet?.slug || 'koramangala';
   const [discounts, setDiscounts] = useState<Discount[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -44,10 +48,20 @@ export default function DiscountsClient() {
   const [deleting, setDeleting] = useState<string | null>(null);
 
   const load = useCallback(async () => {
+    if (!restaurantId) {
+      setDiscounts([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setLoadError(null);
     try {
-      const { data, error } = await supabase.from('discounts').select('*').eq('outlet', 'koramangala').order('created_at', { ascending: false });
+      const { data, error } = await supabase
+        .from('discounts')
+        .select('*')
+        .eq('restaurant_id', restaurantId)
+        .eq('outlet', outletSlug)
+        .order('created_at', { ascending: false });
       if (error) throw error;
       setDiscounts((data || []).map((r: any) => ({
         id: r.id, name: r.name, type: r.type, value: Number(r.value), code: r.code || '',
@@ -63,7 +77,7 @@ export default function DiscountsClient() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [restaurantId, outletSlug]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -86,6 +100,10 @@ export default function DiscountsClient() {
   };
 
   const saveDiscount = async () => {
+    if (!restaurantId) {
+      toast.error('No active restaurant selected');
+      return;
+    }
     if (!form.name.trim()) { toast.error('Discount name is required'); return; }
     if (!form.value || Number(form.value) <= 0) { toast.error('Enter a valid discount value'); return; }
     setSaving(true);
@@ -100,7 +118,9 @@ export default function DiscountsClient() {
         happy_hour_days: form.happyHourDays,
         usage_limit: form.usageLimit ? Number(form.usageLimit) : null,
         valid_from: form.validFrom || null, valid_until: form.validUntil || null,
-        active: form.active, outlet: 'koramangala',
+        active: form.active,
+        restaurant_id: restaurantId,
+        outlet: outletSlug,
       };
       if (editingDiscount) {
         const { error } = await supabase.from('discounts').update(payload).eq('id', editingDiscount.id);

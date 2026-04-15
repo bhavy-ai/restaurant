@@ -4,6 +4,7 @@ import { toast } from 'sonner';
 import { Flame, Clock, CheckCircle, AlertTriangle, RefreshCw, Bell, Zap, X, ChefHat, Loader2, CheckSquare, Square } from 'lucide-react';
 import { createClient } from '@/lib/supabase/client';
 import { kotService } from '@/lib/services/restaurantService';
+import { useAuth } from '@/contexts/AuthContext';
 
 interface KOTItem {
   id: string;
@@ -67,20 +68,25 @@ export default function KDSClient() {
   const [fulfillmentMap, setFulfillmentMap] = useState<Record<string, Record<string, number>>>({});
 
   const supabase = createClient();
+  const { activeRestaurant, activeOutlet, staffUser } = useAuth();
+  const restaurantId = activeRestaurant?.id;
+  const outletSlug = activeOutlet?.slug || staffUser?.outlet || 'koramangala';
   // Debounce ref: prevents duplicate rapid fetches when KOT + items arrive in quick succession
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Load KOTs ──────────────────────────────────────────────────────────
   const loadKOTs = useCallback(async () => {
     try {
-      const data = await kotService.getActive();
+      const data = restaurantId
+        ? await kotService.getActive(outletSlug, { restaurantId, outletSlug })
+        : await kotService.getActive(outletSlug);
       setKots(data as KOT[]);
     } catch (err: any) {
       toast.error('Failed to load KOTs: ' + err.message);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [restaurantId, outletSlug]);
 
   // Debounced refresh — coalesces rapid INSERT events (kots row + kot_items rows)
   const debouncedRefresh = useCallback((delayMs = 400) => {
@@ -99,11 +105,15 @@ export default function KDSClient() {
     const kotChannel = supabase
       .channel('kds_kots')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'kots' }, (payload) => {
+        if (payload.new.outlet !== outletSlug) return;
+        if (restaurantId && payload.new.restaurant_id !== restaurantId) return;
         // Delay fetch so kot_items rows are committed before we query
         debouncedRefresh(400);
         toast.success(`New KOT #${payload.new.kot_number} — ${payload.new.table_label}`, { icon: '🔔' });
       })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'kots' }, (payload) => {
+        if (payload.new.outlet !== outletSlug) return;
+        if (restaurantId && payload.new.restaurant_id !== restaurantId) return;
         const updated = payload.new;
         if (updated.status === 'bumped' || updated.status === 'voided') {
           setKots((prev) => prev.filter((k) => k.id !== updated.id));
@@ -161,7 +171,7 @@ export default function KDSClient() {
       supabase.removeChannel(tableStatusChannel);
       clearInterval(interval);
     };
-  }, [debouncedRefresh]);
+  }, [debouncedRefresh, restaurantId, outletSlug]);
 
   const filteredKOTs = kots.filter((k) => {
     if (k.status === 'ready' && getElapsedMinutes(k.fireTime) > 30) return false;

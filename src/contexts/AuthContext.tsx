@@ -106,7 +106,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const bootstrappedSessionIdRef = useRef<string | null>(null);
 
   // ── Load all restaurants accessible to this user ──────────────
-  const loadRestaurants = useCallback(async (userId?: string, isSuperadmin?: boolean) => {
+  const loadRestaurants = useCallback(async (userId?: string, isSuperadmin?: boolean, staffOutlet?: string, staffRole?: string) => {
     try {
       let restaurants: Restaurant[] = [];
 
@@ -149,22 +149,105 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
             }));
         }
 
-        // Fallback: load all restaurants for authenticated users without access rows
+        // Owners can be attached directly to a restaurant without a user_restaurant_access row.
         if (restaurants.length === 0) {
-          const { data: allRestaurants } = await supabase
+          const { data: ownedRestaurants } = await supabase
             .from('restaurants')
             .select('*')
+            .eq('owner_user_id', userId)
             .eq('is_active', true)
             .order('name');
-          if (allRestaurants) {
-            restaurants = allRestaurants.map((r: any) => ({
-              id: r.id,
-              name: r.name,
-              gstin: r.gstin,
-              fssai: r.fssai,
-              plan: r.plan,
-              isActive: r.is_active,
-            }));
+
+          const { data: createdRestaurants } = await supabase
+            .from('restaurants')
+            .select('*')
+            .eq('created_by_user_id', userId)
+            .eq('is_active', true)
+            .order('name');
+
+          const restaurantMap = new Map<string, any>();
+          [...(ownedRestaurants || []), ...(createdRestaurants || [])].forEach((r: any) => {
+            restaurantMap.set(r.id, r);
+          });
+
+          restaurants = Array.from(restaurantMap.values()).map((r: any) => ({
+            id: r.id,
+            name: r.name,
+            gstin: r.gstin,
+            fssai: r.fssai,
+            plan: r.plan,
+            isActive: r.is_active,
+          }));
+        }
+
+        // Fallback: resolve the restaurant from the staff outlet instead of exposing all restaurants.
+        if (restaurants.length === 0 && staffOutlet) {
+          const { data: outletBySlug } = await supabase
+            .from('outlets')
+            .select('id, restaurant_id')
+            .eq('slug', staffOutlet)
+            .eq('is_active', true)
+            .maybeSingle();
+
+          const { data: outletByName } = outletBySlug ? { data: null } : await supabase
+            .from('outlets')
+            .select('id, restaurant_id')
+            .eq('name', staffOutlet)
+            .eq('is_active', true)
+            .maybeSingle();
+
+          const resolvedOutlet = (outletBySlug as any) || (outletByName as any);
+          const resolvedRestaurantId = resolvedOutlet?.restaurant_id;
+          if (resolvedRestaurantId) {
+            const { data: restaurantRow } = await supabase
+              .from('restaurants')
+              .select('*')
+              .eq('id', resolvedRestaurantId)
+              .eq('is_active', true)
+              .maybeSingle();
+
+            if (restaurantRow) {
+              const row = restaurantRow as any;
+              restaurants = [{
+                id: row.id,
+                name: row.name,
+                gstin: row.gstin,
+                fssai: row.fssai,
+                plan: row.plan,
+                isActive: row.is_active,
+              }];
+            }
+
+            // Backfill access row so future lookups use user_restaurant_access directly.
+            if (userId && resolvedOutlet?.id) {
+              try {
+                const { data: existingAccess } = await (supabase as any)
+                  .from('user_restaurant_access')
+                  .select('id')
+                  .eq('user_id', userId)
+                  .eq('restaurant_id', resolvedRestaurantId)
+                  .maybeSingle();
+
+                if ((existingAccess as any)?.id) {
+                  await (supabase as any)
+                    .from('user_restaurant_access')
+                    .update({ outlet_id: resolvedOutlet.id, is_active: true })
+                    .eq('id', (existingAccess as any).id);
+                } else {
+                  await (supabase as any)
+                    .from('user_restaurant_access')
+                    .insert({
+                      user_id: userId,
+                      restaurant_id: resolvedRestaurantId,
+                      outlet_id: resolvedOutlet.id,
+                      role: staffRole || 'owner',
+                      is_active: true,
+                    });
+                }
+              } catch {
+                // Non-blocking: user can still proceed via resolved outlet fallback.
+              }
+            }
           }
         }
       }
@@ -177,7 +260,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   }, []);
 
   // ── Load outlets for a restaurant ─────────────────────────────
-  const loadOutlets = useCallback(async (restaurantId: string): Promise<Outlet[]> => {
+  const loadOutlets = useCallback(async (restaurantId: string, userId?: string, isSuperadmin?: boolean, staffOutlet?: string, staffRole?: string): Promise<Outlet[]> => {
     try {
       const { data } = await supabase
         .from('outlets')
@@ -185,46 +268,147 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
         .eq('restaurant_id', restaurantId)
         .eq('is_active', true)
         .order('name');
-      if (data) {
-        const outlets = data.map((o: any) => ({
-          id: o.id,
-          restaurantId: o.restaurant_id,
-          name: o.name,
-          slug: o.slug,
-          address: o.address,
-          isActive: o.is_active,
-        }));
-        setAccessibleOutlets(outlets);
-        return outlets;
+
+      const allOutlets = (data || []).map((o: any) => ({
+        id: o.id,
+        restaurantId: o.restaurant_id,
+        name: o.name,
+        slug: o.slug,
+        address: o.address,
+        isActive: o.is_active,
+      }));
+
+      if (allOutlets.length === 0) {
+        setAccessibleOutlets([]);
+        return [];
       }
+
+      if (isSuperadmin) {
+        setAccessibleOutlets(allOutlets);
+        return allOutlets;
+      }
+
+      if (userId) {
+        const { data: restaurantRow } = await supabase
+          .from('restaurants')
+          .select('owner_user_id, created_by_user_id')
+          .eq('id', restaurantId)
+          .maybeSingle();
+
+        if ((restaurantRow as any)?.owner_user_id === userId || (restaurantRow as any)?.created_by_user_id === userId) {
+          setAccessibleOutlets(allOutlets);
+          return allOutlets;
+        }
+
+        const { data: accessRow } = await supabase
+          .from('user_restaurant_access')
+          .select('role, outlet_id')
+          .eq('user_id', userId)
+          .eq('restaurant_id', restaurantId)
+          .eq('is_active', true)
+          .maybeSingle();
+
+        if ((accessRow as any)?.role === 'owner' || !(accessRow as any)?.outlet_id) {
+          setAccessibleOutlets(allOutlets);
+          return allOutlets;
+        }
+
+        const restrictedOutlets = allOutlets.filter((outlet) => outlet.id === (accessRow as any).outlet_id);
+        if (restrictedOutlets.length > 0) {
+          setAccessibleOutlets(restrictedOutlets);
+          return restrictedOutlets;
+        }
+      }
+
+      if (staffOutlet) {
+        const resolvedOutlet = allOutlets.find((outlet) => outlet.slug === staffOutlet || outlet.name === staffOutlet);
+        if (resolvedOutlet) {
+          setAccessibleOutlets([resolvedOutlet]);
+          return [resolvedOutlet];
+        }
+      }
+
+      setAccessibleOutlets(allOutlets);
+      return allOutlets;
     } catch {}
     return [];
   }, []);
 
   // ── Load staff user profile ────────────────────────────────────
-  async function loadStaffUser(email: string) {
+  async function loadStaffUser(email: string, userId?: string) {
+    const resolveFromAccess = async () => {
+      if (!userId) return null;
+      const { data: accessRows } = await supabase
+        .from('user_restaurant_access')
+        .select('role, outlet_id, restaurants(name)')
+        .eq('user_id', userId)
+        .eq('is_active', true)
+        .limit(1);
+
+      if (accessRows && accessRows.length > 0) {
+        const access = accessRows[0] as any;
+        const role = (access.role as string) || 'owner';
+        const staffUserValue = {
+          id: userId,
+          name: email.split('@')[0],
+          email,
+          role: role as 'owner' | 'manager' | 'cashier' | 'captain' | 'kitchen' | 'accountant',
+          outlet: '',
+          permissions: ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.owner,
+        };
+        setStaffUser(staffUserValue);
+        return staffUserValue;
+      }
+
+      return null;
+    };
+
     try {
       const { data } = await supabase
         .from('staff_users')
         .select('*')
         .eq('email', email)
-        .eq('status', 'active')
         .maybeSingle();
+
       if (data) {
         const staff = data as any;
-        setStaffUser({
+
+        const statusValue = typeof staff.status === 'string' ? staff.status.toLowerCase() : null;
+        const isActive =
+          (statusValue ? statusValue === 'active' : true) &&
+          (typeof staff.is_active === 'boolean' ? staff.is_active : true);
+
+        if (!isActive) {
+          setStaffUser(null);
+          return null;
+        }
+
+        const role = (staff.role || staff.staff_role || 'owner') as string;
+        const staffUserValue = {
           id: staff.id,
           name: staff.name,
           email: staff.email,
-          role: staff.role,
+          role: role as 'owner' | 'manager' | 'cashier' | 'captain' | 'kitchen' | 'accountant',
           outlet: staff.outlet,
-          permissions: staff.permissions || ROLE_PERMISSIONS[staff.role] || [],
-        });
-      } else {
-        setStaffUser(null);
+          permissions: (Array.isArray(staff.permissions) && staff.permissions.length > 0)
+            ? staff.permissions
+            : (ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.owner),
+        };
+        setStaffUser(staffUserValue);
+        return staffUserValue;
       }
-    } catch {
+
+      const fallbackAccess = await resolveFromAccess();
+      if (fallbackAccess) return fallbackAccess;
+
       setStaffUser(null);
+      return null;
+    } catch {
+      const fallbackAccess = await resolveFromAccess();
+      if (fallbackAccess) return fallbackAccess;
+
+      setStaffUser(null);
+      return null;
     }
   }
 
@@ -247,8 +431,8 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   }
 
   // ── Bootstrap restaurant + outlet context ─────────────────────
-  const bootstrapContext = useCallback(async (userId?: string, isSuperadmin?: boolean) => {
-    let restaurants = await loadRestaurants(userId, isSuperadmin);
+  const bootstrapContext = useCallback(async (userId?: string, isSuperadmin?: boolean, staffOutlet?: string, staffRole?: string) => {
+    let restaurants = await loadRestaurants(userId, isSuperadmin, staffOutlet, staffRole);
     if (restaurants.length === 0) return;
 
     // Restore persisted restaurant or use first
@@ -259,7 +443,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     persistRestaurant(targetRestaurant.id);
 
     // Load outlets for this restaurant
-    const outlets = await loadOutlets(targetRestaurant.id);
+    const outlets = await loadOutlets(targetRestaurant.id, userId, isSuperadmin, staffOutlet, staffRole);
     if (outlets.length === 0) return;
 
     // Restore persisted outlet or use first
@@ -278,14 +462,14 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     persistRestaurant(restaurant.id);
 
     // Load outlets for new restaurant
-    const outlets = await loadOutlets(restaurantId);
+    const outlets = await loadOutlets(restaurantId, user?.id || undefined, isSuperadmin, staffUser?.outlet, staffUser?.role);
     if (outlets.length > 0) {
       setActiveOutlet(outlets[0]);
       persistOutlet(outlets[0].id);
     } else {
       setActiveOutlet(null);
     }
-  }, [accessibleRestaurants, loadOutlets]);
+  }, [accessibleRestaurants, loadOutlets, user?.id, isSuperadmin, staffUser?.outlet, staffUser?.role]);
 
   // ── Switch outlet ──────────────────────────────────────────────
   const switchOutlet = useCallback((outletId: string) => {
@@ -355,11 +539,12 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
               setSuperadminId(sadminId);
               setStaffUser(null);
             } else if (session.user?.email) {
-              await loadStaffUser(session.user.email);
+              const staff = await loadStaffUser(session.user.email, session.user.id);
+              await bootstrapContext(session.user.id, isSuper, staff?.outlet, staff?.role);
             } else {
               setStaffUser(null);
+              await bootstrapContext(session.user.id, isSuper);
             }
-            await bootstrapContext(session.user.id, isSuper);
           })().finally(() => {
             bootstrappedSessionIdRef.current = currentSessionId;
             setLoading(false);

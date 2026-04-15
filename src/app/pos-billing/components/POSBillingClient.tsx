@@ -4,7 +4,7 @@ import { toast } from 'sonner';
 import { ShoppingCart, Printer, CreditCard, Smartphone, Banknote, Plus, Minus, Trash2, Tag, Users, X, CheckCircle, Utensils, Bike, Package, SplitSquareVertical, RotateCcw, Loader2, Gift, Search, AlertTriangle, Eye, Bell } from 'lucide-react';
 import { useSearchParams } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
-import { menuService, tableService, billService, shiftService } from '@/lib/services/restaurantService';
+import { menuService, tableService, billService, shiftService, kotService } from '@/lib/services/restaurantService';
 import { auditService } from '@/lib/services/restaurantService';
 import { offlineQueue } from '@/lib/offlineQueue';
 import { generateIdempotencyKey } from '@/lib/offlineQueue';
@@ -36,10 +36,20 @@ interface CartItem {
   isVeg: boolean;
 }
 
+interface PendingPosOrder {
+  id: string;
+  orderNumber: string;
+  orderType: 'takeaway' | 'delivery';
+  cart: CartItem[];
+  total: number;
+  createdAt: string;
+}
+
 interface Table {
   id: string;
   label: string;
   status: 'available' | 'occupied' | 'bill_requested';
+  captain?: string;
 }
 
 type OrderType = 'dine-in' | 'takeaway' | 'delivery';
@@ -67,6 +77,14 @@ function calcCart(cart: CartItem[], discountPct: number) {
 }
 
 const menuCategories = ['All', 'Starters', 'Main Course', 'Breads', 'Rice & Biryani', 'Beverages', 'Desserts'];
+
+function getPosDraftKey(restaurantId?: string, outletSlug?: string) {
+  return restaurantId ? `restro_pos_draft_${restaurantId}_${outletSlug || 'default'}` : null;
+}
+
+function getPosPendingOrdersKey(restaurantId?: string, outletSlug?: string) {
+  return restaurantId ? `restro_pos_pending_orders_${restaurantId}_${outletSlug || 'default'}` : null;
+}
 
 // ── Recipe stock deduction helper ─────────────────────────────────────────
 async function deductRecipeStockForCart(supabase: ReturnType<typeof import('@/lib/supabase/client').createClient>, cartItems: CartItem[]) {
@@ -137,7 +155,6 @@ export default function POSBillingClient() {
   const [showPayModal, setShowPayModal] = useState(false);
   const [processingPayment, setProcessingPayment] = useState(false);
   const [searchItem, setSearchItem] = useState('');
-  const [steward] = useState('Arjun Nair');
   const [loading, setLoading] = useState(true);
   const [activeShiftId, setActiveShiftId] = useState<string | null>(null);
   const [billCounter, setBillCounter] = useState(1192);
@@ -151,6 +168,7 @@ export default function POSBillingClient() {
   const [loyaltyPointsToRedeem, setLoyaltyPointsToRedeem] = useState(0);
   const [showLoyaltyPanel, setShowLoyaltyPanel] = useState(false);
   const [loyaltySearching, setLoyaltySearching] = useState(false);
+  const [kotSentForCart, setKotSentForCart] = useState(false);
 
   // ── KOT Printer ────────────────────────────────────────────────────────
   const [kotPrinterIp, setKotPrinterIp] = useState<string | null>(null);
@@ -160,7 +178,16 @@ export default function POSBillingClient() {
   const [lastBillData, setLastBillData] = useState<any>(null);
 
   const supabase = createClient();
-  const { staffUser } = useAuth();
+  const { staffUser, activeRestaurant, activeOutlet } = useAuth();
+  const steward = selectedTable?.captain?.trim() || staffUser?.name || 'Captain';
+  const restaurantId = activeRestaurant?.id;
+  const outletSlug = activeOutlet?.slug || staffUser?.outlet || 'koramangala';
+  const draftKey = getPosDraftKey(restaurantId, outletSlug);
+  const pendingOrdersKey = getPosPendingOrdersKey(restaurantId, outletSlug);
+  const draftLoadedRef = useRef(false);
+  const pendingLoadedRef = useRef(false);
+  const [pendingPosOrders, setPendingPosOrders] = useState<PendingPosOrder[]>([]);
+  const [activePendingOrderId, setActivePendingOrderId] = useState<string | null>(null);
 
   // ── Idempotency keys (stable per session action) ───────────────────────
   const [kotIdempotencyKey, setKotIdempotencyKey] = useState<string>('');
@@ -176,24 +203,30 @@ export default function POSBillingClient() {
 
   // ── Load initial data ──────────────────────────────────────────────────
   const loadData = useCallback(async () => {
+    if (!restaurantId) {
+      setMenuItems([]);
+      setTables([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
       const [menuData, tableData, shift] = await Promise.all([
-        menuService.getAll(),
-        tableService.getAll(),
-        shiftService.getActive(),
+        menuService.getAll(outletSlug, { restaurantId, outletSlug }),
+        tableService.getAll(outletSlug, { restaurantId, outletSlug }),
+        shiftService.getActive(outletSlug, { restaurantId, outletSlug }),
       ]);
       setMenuItems(menuData);
       const posTables = tableData
         .filter((t) => ['Indoor', 'Bar', 'Outdoor', 'Private Dining'].includes(t.section))
-        .map((t) => ({ id: t.id, label: t.label, status: t.status as Table['status'] }));
+        .map((t) => ({ id: t.id, label: t.label, status: t.status as Table['status'], captain: t.captain || undefined }));
       setTables(posTables);
 
       // If navigated from table management with a pre-selected table, auto-select it
       if (preloadTable) {
         const match = tableData.find((t: any) => t.label === preloadTable);
         if (match) {
-          setSelectedTable({ id: match.id, label: match.label, status: match.status as Table['status'] });
+          setSelectedTable({ id: match.id, label: match.label, status: match.status as Table['status'], captain: match.captain || undefined });
           setOrderType('dine-in');
           if (preloadCovers) setCovers(preloadCovers);
 
@@ -252,11 +285,31 @@ export default function POSBillingClient() {
 
       if (shift) setActiveShiftId(shift.id);
 
+      // Seed the bill counter from the latest persisted bill so we do not
+      // reuse an existing bill number and accidentally hit idempotency replay.
+      const { data: latestBill } = await supabase
+        .from('bills')
+        .select('bill_number')
+        .eq('restaurant_id', restaurantId)
+        .eq('outlet', outletSlug)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      const latestBillNumber = String(latestBill?.bill_number || '');
+      const latestBillMatch = latestBillNumber.match(/(\d+)$/);
+      if (latestBillMatch) {
+        const nextBillCounter = Number(latestBillMatch[1]) + 1;
+        if (Number.isFinite(nextBillCounter) && nextBillCounter > 0) {
+          setBillCounter(nextBillCounter);
+        }
+      }
+
       // Load KOT printer IP
       const { data: printers } = await supabase
         .from('printer_config')
         .select('ip_address, port')
-        .eq('outlet', 'koramangala')
+        .eq('outlet', outletSlug)
+        .eq('restaurant_id', restaurantId)
         .eq('printer_type', 'kot')
         .eq('enabled', true)
         .limit(1);
@@ -268,11 +321,84 @@ export default function POSBillingClient() {
     } finally {
       setLoading(false);
     }
-  }, [preloadTable, preloadCovers]);
+  }, [preloadTable, preloadCovers, restaurantId, outletSlug]);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  useEffect(() => {
+    draftLoadedRef.current = false;
+    if (!draftKey || preloadTable) return;
+    try {
+      const raw = localStorage.getItem(draftKey);
+      if (!raw) return;
+      const draft = JSON.parse(raw);
+      if (draft && typeof draft === 'object') {
+        setCart(Array.isArray(draft.cart) ? draft.cart : []);
+        setSelectedTable(draft.selectedTable || null);
+        setOrderType(draft.orderType || 'dine-in');
+        if (typeof draft.covers === 'number') setCovers(draft.covers);
+        if (typeof draft.discountPct === 'number') setDiscountPct(draft.discountPct);
+        if (typeof draft.couponCode === 'string') setCouponCode(draft.couponCode);
+        if (typeof draft.paymentMode === 'string') setPaymentMode(draft.paymentMode);
+        if (typeof draft.cashTendered === 'string') setCashTendered(draft.cashTendered);
+        if (typeof draft.splitCash === 'string') setSplitCash(draft.splitCash);
+        if (typeof draft.splitUpi === 'string') setSplitUpi(draft.splitUpi);
+      }
+    } catch {
+      // Ignore malformed drafts and start fresh.
+    } finally {
+      draftLoadedRef.current = true;
+    }
+  }, [draftKey, preloadTable]);
+
+  useEffect(() => {
+    if (!draftKey || !draftLoadedRef.current || preloadTable) return;
+    try {
+      localStorage.setItem(draftKey, JSON.stringify({
+        cart,
+        selectedTable,
+        orderType,
+        covers,
+        discountPct,
+        couponCode,
+        paymentMode,
+        cashTendered,
+        splitCash,
+        splitUpi,
+      }));
+    } catch {
+      // Non-blocking
+    }
+  }, [draftKey, preloadTable, cart, selectedTable, orderType, covers, discountPct, couponCode, paymentMode, cashTendered, splitCash, splitUpi]);
+
+  useEffect(() => {
+    pendingLoadedRef.current = false;
+    if (!pendingOrdersKey) return;
+    try {
+      const raw = localStorage.getItem(pendingOrdersKey);
+      if (!raw) {
+        setPendingPosOrders([]);
+        return;
+      }
+      const parsed = JSON.parse(raw);
+      setPendingPosOrders(Array.isArray(parsed) ? parsed : []);
+    } catch {
+      setPendingPosOrders([]);
+    } finally {
+      pendingLoadedRef.current = true;
+    }
+  }, [pendingOrdersKey]);
+
+  useEffect(() => {
+    if (!pendingOrdersKey || !pendingLoadedRef.current) return;
+    try {
+      localStorage.setItem(pendingOrdersKey, JSON.stringify(pendingPosOrders));
+    } catch {
+      // Non-blocking
+    }
+  }, [pendingOrdersKey, pendingPosOrders]);
 
   // ── Real-time subscriptions ────────────────────────────────────────────
   useEffect(() => {
@@ -307,14 +433,15 @@ export default function POSBillingClient() {
         const newStatus = payload.new.status as Table['status'];
         const tableId = payload.new.id as string;
         const tableLabel = payload.new.label as string;
+        const newCaptain = (payload.new.captain as string | null) || undefined;
 
         setTables((prev) =>
           prev.map((t) =>
-            t.id === tableId ? { ...t, status: newStatus } : t
+            t.id === tableId ? { ...t, status: newStatus, captain: newCaptain } : t
           )
         );
         setSelectedTable((prev) =>
-          prev?.id === tableId ? { ...prev, status: newStatus } : prev
+          prev?.id === tableId ? { ...prev, status: newStatus, captain: newCaptain } : prev
         );
 
         // Show toast only if this status change hasn't already been announced
@@ -343,15 +470,16 @@ export default function POSBillingClient() {
         if (!payload?.label) return;
         const newStatus = payload.status as Table['status'];
         const tableLabel = payload.label as string;
+        const captain = (payload.captain as string | undefined) || undefined;
 
         // Update table status in POS table selector
         setTables((prev) =>
           prev.map((t) =>
-            t.label === tableLabel ? { ...t, status: newStatus } : t
+            t.label === tableLabel ? { ...t, status: newStatus, captain } : t
           )
         );
         setSelectedTable((prev) =>
-          prev?.label === tableLabel ? { ...prev, status: newStatus } : prev
+          prev?.label === tableLabel ? { ...prev, status: newStatus, captain } : prev
         );
 
         // Mark as seen so the postgres_changes channel doesn't double-toast
@@ -386,8 +514,9 @@ export default function POSBillingClient() {
     if (!item.available) return;
     setCart((prev) => {
       const existing = prev.find((c) => c.menuItemId === item.id);
-      if (existing) return prev.map((c) => c.menuItemId === item.id ? { ...c, qty: c.qty + 1 } : c);
-      return [...prev, { menuItemId: item.id, name: item.name, price: item.price, qty: 1, gstRate: item.gstRate, isVeg: item.isVeg }];
+      const nextCart = existing ? prev.map((c) => c.menuItemId === item.id ? { ...c, qty: c.qty + 1 } : c) : [...prev, { menuItemId: item.id, name: item.name, price: item.price, qty: 1, gstRate: item.gstRate, isVeg: item.isVeg }];
+      setKotSentForCart(false);
+      return nextCart;
     });
   }
 
@@ -396,10 +525,12 @@ export default function POSBillingClient() {
       prev.map((c) => c.menuItemId === menuItemId ? { ...c, qty: c.qty + delta } : c)
           .filter((c) => c.qty > 0)
     );
+    setKotSentForCart(false);
   }
 
   function removeFromCart(menuItemId: string) {
     setCart((prev) => prev.filter((c) => c.menuItemId !== menuItemId));
+    setKotSentForCart(false);
   }
 
   function applyCoupon() {
@@ -419,8 +550,207 @@ export default function POSBillingClient() {
     }
   }
 
+  async function createKitchenTicket() {
+    if (cart.length === 0) { toast.error('Add items before sending KOT'); return false; }
+    if (orderType === 'dine-in' && !selectedTable) { toast.error('Select a table before sending KOT'); return false; }
+    if (!restaurantId) { toast.error('Restaurant context missing. Refresh and try again.'); return false; }
+
+    if (kotSentForCart) {
+      toast.success('KOT already sent for this cart');
+      return true;
+    }
+
+    const tableLabel = orderType === 'dine-in' ? (selectedTable?.label || '') : orderType === 'takeaway' ? 'TKW' : 'DEL';
+    const kotNumber = `K-${Date.now().toString().slice(-4)}`;
+    const orderNumber = `POS-${orderType === 'takeaway' ? 'TKW' : 'DEL'}-${Date.now().toString().slice(-6)}`;
+    const subtotalLive = cart.reduce((s, i) => s + i.price * i.qty, 0);
+    const gstLive = Math.round(subtotalLive * 0.05);
+    const totalLive = subtotalLive + gstLive;
+
+    let persistedOrderId: string | undefined;
+
+    if (orderType !== 'dine-in') {
+      if (!isOnline) {
+        await offlineQueue.enqueue('takeaway_create', {
+          restaurant_id: restaurantId,
+          outlet: outletSlug,
+          order_number: orderNumber,
+          order_type: orderType,
+          customer_name: activePendingOrderId ? pendingPosOrders.find((o) => o.id === activePendingOrderId)?.orderNumber : `Walk-in ${orderNumber}`,
+          customer_phone: null,
+          delivery_address: null,
+          items: cart.map((c) => ({ name: c.name, qty: c.qty, price: c.price, menuItemId: c.menuItemId, isVeg: c.isVeg })),
+          subtotal: subtotalLive,
+          gst_amount: gstLive,
+          discount_amount: 0,
+          total: totalLive,
+          payment_mode: paymentMode,
+          status: 'pending',
+          estimated_time: 20,
+          notes: null,
+        }, generateIdempotencyKey(`pos_takeaway_${orderNumber}`));
+        persistedOrderId = `local-${orderNumber}`;
+      } else {
+        const { data: row, error: takeawayErr } = await supabase
+          .from('takeaway_orders')
+          .insert({
+            restaurant_id: restaurantId,
+            outlet: outletSlug,
+            order_number: orderNumber,
+            order_type: orderType,
+            customer_name: `Walk-in ${orderNumber}`,
+            customer_phone: null,
+            delivery_address: null,
+            items: cart.map((c) => ({ name: c.name, qty: c.qty, price: c.price, menuItemId: c.menuItemId, isVeg: c.isVeg })),
+            subtotal: subtotalLive,
+            gst_amount: gstLive,
+            discount_amount: 0,
+            total: totalLive,
+            payment_mode: paymentMode,
+            status: 'pending',
+            estimated_time: 20,
+            notes: null,
+          })
+          .select('id')
+          .single();
+        if (takeawayErr) throw takeawayErr;
+        persistedOrderId = row?.id;
+      }
+    }
+
+    const kotPayload = {
+      kotNumber,
+      orderId: orderType === 'dine-in' ? persistedOrderId : undefined,
+      tableLabel,
+      orderType,
+      station: 'Main Kitchen',
+      priority: 'normal',
+      steward,
+      covers: orderType === 'dine-in' ? covers : 0,
+      outlet: outletSlug,
+      items: cart.map((c) => ({
+        menuItemId: c.menuItemId,
+        name: c.name,
+        qty: c.qty,
+        note: c.note,
+        isVeg: c.isVeg,
+      })),
+    };
+
+    if (!isOnline) {
+      const kotKey = kotIdempotencyKey || generateIdempotencyKey(`kot_${kotNumber}`);
+      setKotIdempotencyKey(kotKey);
+      await offlineQueue.enqueue('kot_create', { ...kotPayload, restaurantId, outletSlug }, kotKey);
+      setKotSentForCart(true);
+
+      if (orderType !== 'dine-in') {
+        const pendingId = persistedOrderId || `local-${orderNumber}`;
+        const pending: PendingPosOrder = {
+          id: pendingId,
+          orderNumber,
+          orderType,
+          cart: [...cart],
+          total: totalLive,
+          createdAt: new Date().toISOString(),
+        };
+        setPendingPosOrders((prev) => [pending, ...prev.filter((o) => o.id !== pendingId)]);
+        setActivePendingOrderId(pendingId);
+        setCart([]);
+        setKotSentForCart(false);
+        toast.success(`KOT #${kotNumber} queued. Order parked for billing.`);
+        return true;
+      }
+
+      toast.success(`KOT #${kotNumber} queued — will sync when online`);
+      return true;
+    }
+
+    try {
+      await kotService.create(kotPayload, { restaurantId, outletSlug });
+      setKotSentForCart(true);
+
+      if (orderType === 'dine-in' && selectedTable) {
+        try {
+          await tableService.update(selectedTable.id, { status: 'occupied' });
+          setTables((prev) => prev.map((t) => t.id === selectedTable.id ? { ...t, status: 'occupied' as Table['status'] } : t));
+          supabase.channel('table_status_sync').send({
+            type: 'broadcast',
+            event: 'table_status_changed',
+            payload: {
+              tableId: selectedTable.id,
+              label: selectedTable.label,
+              status: 'occupied',
+              updatedAt: new Date().toISOString(),
+            },
+          }).catch(() => {/* non-blocking */});
+        } catch {
+          // non-blocking
+        }
+      }
+
+      if (orderType !== 'dine-in') {
+        const pendingId = persistedOrderId || `local-${orderNumber}`;
+        const pending: PendingPosOrder = {
+          id: pendingId,
+          orderNumber,
+          orderType,
+          cart: [...cart],
+          total: totalLive,
+          createdAt: new Date().toISOString(),
+        };
+        setPendingPosOrders((prev) => [pending, ...prev.filter((o) => o.id !== pendingId)]);
+        setActivePendingOrderId(pendingId);
+        setCart([]);
+        setKotSentForCart(false);
+        toast.success(`KOT #${kotNumber} sent. Order parked for billing.`);
+        return true;
+      }
+
+      toast.success(`KOT #${kotNumber} sent to kitchen`);
+      return true;
+    } catch (err: any) {
+      toast.error('Failed to send KOT: ' + err.message);
+      return false;
+    }
+  }
+
+  function loadPendingPosOrder(orderId: string) {
+    const order = pendingPosOrders.find((o) => o.id === orderId);
+    if (!order) return;
+    setOrderType(order.orderType);
+    setSelectedTable(null);
+    setCart(order.cart);
+    setActivePendingOrderId(order.id);
+    setKotSentForCart(true);
+    setShowMobileCart(true);
+    toast.success(`Loaded ${order.orderNumber} for billing`);
+  }
+
+  function removePendingPosOrder(orderId: string) {
+    const target = pendingPosOrders.find((o) => o.id === orderId);
+    setPendingPosOrders((prev) => prev.filter((o) => o.id !== orderId));
+    if (activePendingOrderId === orderId) {
+      setActivePendingOrderId(null);
+      setCart([]);
+      setKotSentForCart(false);
+    }
+    toast.success(target ? `${target.orderNumber} removed from parked list` : 'Removed from parked list');
+  }
+
+  function startNewClientOrder() {
+    setCart([]);
+    setKotSentForCart(false);
+    setActivePendingOrderId(null);
+    setDiscountPct(0);
+    setCouponCode('');
+    setLoyaltyCustomer(null);
+    setLoyaltyPointsToRedeem(0);
+    setLoyaltyPhone('');
+    setShowLoyaltyPanel(false);
+    toast.success('Ready for new client');
+  }
+
   function sendKOT() {
-    if (cart.length === 0) { toast.error('Add items before sending KOT'); return; }
     setShowKotModal(true);
   }
 
@@ -432,44 +762,68 @@ export default function POSBillingClient() {
   // ── Load KOTs for a bill-requested table and open payment ─────────────
   const [loadingBillTable, setLoadingBillTable] = useState(false);
 
+  function aggregateTableCartFromKOTs(kots: any[]): CartItem[] {
+    const aggregatedCart: CartItem[] = [];
+    (kots || []).forEach((kot: any) => {
+      (kot.kot_items || []).forEach((item: any) => {
+        const menuMatch = menuItems.find((m: MenuItem) => m.id === item.menu_item_id);
+        const existing = aggregatedCart.find((c) => c.menuItemId === item.menu_item_id);
+        if (existing) {
+          existing.qty += item.qty;
+        } else {
+          aggregatedCart.push({
+            menuItemId: item.menu_item_id || '',
+            name: item.name,
+            price: menuMatch ? menuMatch.price : 0,
+            qty: item.qty,
+            gstRate: menuMatch ? menuMatch.gstRate : 5,
+            hsnCode: menuMatch ? menuMatch.hsnCode : '',
+            isVeg: item.is_veg,
+            note: item.note || undefined,
+          });
+        }
+      });
+    });
+    return aggregatedCart;
+  }
+
+  async function loadCartForTable(table: Table) {
+    const supabaseClient = createClient();
+    const { data: kots } = await supabaseClient
+      .from('kots')
+      .select('id, kot_number, fire_time, kot_items(id, name, qty, note, is_veg, menu_item_id)')
+      .eq('table_label', table.label)
+      .not('status', 'in', '("voided")')
+      .order('fire_time', { ascending: true });
+    return aggregateTableCartFromKOTs(kots || []);
+  }
+
+  async function selectDineInTable(table: Table) {
+    setSelectedTable(table);
+    setOrderType('dine-in');
+    setKotSentForCart(false);
+    setActivePendingOrderId(null);
+
+    if (table.status === 'occupied' || table.status === 'bill_requested') {
+      try {
+        const aggregatedCart = await loadCartForTable(table);
+        setCart(aggregatedCart);
+      } catch {
+        setCart([]);
+      }
+      return;
+    }
+
+    setCart([]);
+  }
+
   async function handleGenerateBillForTable(table: Table) {
     if (loadingBillTable) return;
     setLoadingBillTable(true);
     try {
       setSelectedTable(table);
       setOrderType('dine-in');
-
-      const supabaseClient = createClient();
-      const { data: kots } = await supabaseClient
-        .from('kots')
-        .select('id, kot_number, fire_time, kot_items(id, name, qty, note, is_veg, menu_item_id)')
-        .eq('table_label', table.label)
-        .not('status', 'in', '("voided")')
-        .order('fire_time', { ascending: true });
-
-      const aggregatedCart: CartItem[] = [];
-      if (kots && kots.length > 0) {
-        kots.forEach((kot: any) => {
-          (kot.kot_items || []).forEach((item: any) => {
-            const menuMatch = menuItems.find((m: MenuItem) => m.id === item.menu_item_id);
-            const existing = aggregatedCart.find((c) => c.menuItemId === item.menu_item_id);
-            if (existing) {
-              existing.qty += item.qty;
-            } else {
-              aggregatedCart.push({
-                menuItemId: item.menu_item_id || '',
-                name: item.name,
-                price: menuMatch ? menuMatch.price : 0,
-                qty: item.qty,
-                gstRate: menuMatch ? menuMatch.gstRate : 5,
-                hsnCode: menuMatch ? menuMatch.hsnCode : '',
-                isVeg: item.is_veg,
-                note: item.note || undefined,
-              });
-            }
-          });
-        });
-      }
+      const aggregatedCart = await loadCartForTable(table);
 
       if (aggregatedCart.length > 0) {
         setCart(aggregatedCart);
@@ -495,6 +849,8 @@ export default function POSBillingClient() {
       const { data } = await supabase
         .from('customers')
         .select('id, name, phone, loyalty_points, total_spent, visit_count')
+        .eq('restaurant_id', restaurantId || '')
+        .eq('outlet', outletSlug)
         .eq('phone', loyaltyPhone.startsWith('+') ? loyaltyPhone : `+91${loyaltyPhone.replace(/^0/, '')}`)
         .single();
       if (data) {
@@ -514,31 +870,12 @@ export default function POSBillingClient() {
 
   async function confirmKOT() {
     setShowKotModal(false);
-    if (!selectedTable) return;
-    const kotNumber = `K-${Date.now().toString().slice(-4)}`;
-    const kotKey = kotIdempotencyKey || generateIdempotencyKey(`kot_${kotNumber}`);
-    setKotIdempotencyKey(kotKey);
-    const kotPayload = {
-      kotNumber,
-      tableLabel: orderType === 'dine-in' ? selectedTable.label : orderType === 'takeaway' ? 'TKW' : 'DEL',
-      orderType,
-      station: 'Main Kitchen',
-      priority: 'normal',
-      steward,
-      covers,
-      items: cart.map((c) => ({
-        menuItemId: c.menuItemId,
-        name: c.name,
-        qty: c.qty,
-        note: c.note,
-        isVeg: c.isVeg,
-      })),
-    };
-
-    if (!isOnline) {
-      await offlineQueue.enqueue('order_create', kotPayload, kotKey);
-      toast.success(`KOT #${kotNumber} queued — will sync when online`);
-      return;
+    if (!kotSentForCart) {
+      const kotCreated = await createKitchenTicket();
+      if (!kotCreated) {
+        setProcessingPayment(false);
+        return;
+      }
     }
 
     try {
@@ -563,11 +900,12 @@ export default function POSBillingClient() {
         splitCash: splitCash ? Number(splitCash) : undefined,
         splitUpi: splitUpi ? Number(splitUpi) : undefined,
         cashier: staffUser?.name || 'Rahul Sharma',
+        outlet: outletSlug,
         shiftId: activeShiftId || undefined,
         idempotencyKey: billKey,
       };
 
-      const billResult = await billService.settle(billPayload);
+      const billResult = await billService.settle(billPayload, { restaurantId: restaurantId || '', outletSlug });
       await deductRecipeStockForCart(supabase, cart);
 
       // Deduct loyalty points if redeemed
@@ -585,7 +923,8 @@ export default function POSBillingClient() {
 
         // Log redemption
         await supabase.from('loyalty_redemptions').insert({
-          outlet: 'koramangala',
+          restaurant_id: restaurantId,
+          outlet: outletSlug,
           customer_id: loyaltyCustomer.id,
           customer_name: loyaltyCustomer.name,
           points_redeemed: pointsUsed,
@@ -641,8 +980,8 @@ export default function POSBillingClient() {
         entity: billNum,
         details: `Table: ${billPayload.tableLabel} | Amount: ₹${finalGrandTotal.toLocaleString('en-IN')} | Mode: ${paymentMode.toUpperCase()} | Items: ${billPayload.itemsCount}${discountAmt > 0 ? ` | Discount: ₹${discountAmt}` : ''}`,
         severity: 'info',
-        outlet: staffUser?.outlet || 'koramangala',
-      }).catch(() => {/* non-blocking */});
+        outlet: outletSlug,
+      }, { restaurantId: restaurantId || '', outletSlug }).catch(() => {/* non-blocking */});
 
       // Sync bill settlement to Table Management + KDS: mark table as cleaning
       if (orderType === 'dine-in' && selectedTable) {
@@ -668,6 +1007,12 @@ export default function POSBillingClient() {
       }
 
       setShowInvoice(true);
+
+      if (orderType !== 'dine-in' && activePendingOrderId) {
+        setPendingPosOrders((prev) => prev.filter((o) => o.id !== activePendingOrderId));
+        setActivePendingOrderId(null);
+      }
+
       setCart([]);
       setDiscountPct(0);
       setCouponCode('');
@@ -678,10 +1023,11 @@ export default function POSBillingClient() {
       setShowLoyaltyPanel(false);
       // Reset selected table so bill-requested bar clears and state is fresh
       setSelectedTable(null);
+      setKotSentForCart(false);
     } catch (err: any) {
       setProcessingPayment(false);
       toast.error('Payment failed: ' + err.message);
-      await offlineQueue.enqueue('bill_create', billPayload, billKey);
+      await offlineQueue.enqueue('bill_create', { ...billPayload, restaurantId, outletSlug }, billKey);
       toast.info('Bill queued for retry when connection restores');
     }
   }
@@ -701,8 +1047,8 @@ export default function POSBillingClient() {
       entity: selectedTable?.label || orderType,
       details: `Reason: ${reason} | Items: ${cart.reduce((s, i) => s + i.qty, 0)} | Table: ${selectedTable?.label || orderType}`,
       severity: 'warning',
-      outlet: staffUser?.outlet || 'koramangala',
-    }).catch(() => {/* non-blocking */});
+      outlet: outletSlug,
+    }, { restaurantId: restaurantId || '', outletSlug }).catch(() => {/* non-blocking */});
 
     // ── If the table was bill_requested, mark it available again ──────
     if (orderType === 'dine-in' && selectedTable && selectedTable.status === 'bill_requested') {
@@ -737,6 +1083,7 @@ export default function POSBillingClient() {
     setLoyaltyPhone('');
     setVoidReason('');
     setVoidOtherReason('');
+    setKotSentForCart(false);
     toast.success(`Order voided — ${reason}`);
   }
 
@@ -803,7 +1150,7 @@ export default function POSBillingClient() {
               {tables.filter((t) => t.status !== 'bill_requested').map((t) => (
                 <button
                   key={`tsel-${t.id}`}
-                  onClick={() => setSelectedTable(t)}
+                  onClick={() => { void selectDineInTable(t); }}
                   className={`relative px-2 py-1 rounded-md text-xs transition-all ${
                     selectedTable?.id === t.id
                       ? t.status === 'occupied' ?'bg-amber-500/20 text-amber-400 border border-amber-500/30 font-bold' :'bg-secondary text-muted-foreground border border-border font-bold'
@@ -974,7 +1321,7 @@ export default function POSBillingClient() {
               KOT
             </button>
             <button
-              onClick={() => setCart([])}
+              onClick={startNewClientOrder}
               className="w-7 h-7 flex items-center justify-center rounded-lg bg-secondary text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-all"
               title="Clear order"
             >
@@ -982,6 +1329,51 @@ export default function POSBillingClient() {
             </button>
           </div>
         </div>
+
+        {/* Pending takeaway/delivery orders */}
+        {orderType !== 'dine-in' && pendingPosOrders.length > 0 && (
+          <div className="px-3 py-2 border-b border-border bg-secondary/20">
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-wide">Parked Orders</p>
+              <button
+                onClick={startNewClientOrder}
+                className="text-[10px] px-2 py-0.5 rounded border border-border bg-card text-foreground hover:border-primary/40"
+              >
+                New Client
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {pendingPosOrders.slice(0, 8).map((o) => (
+                <button
+                  key={`pending-${o.id}`}
+                  onClick={() => loadPendingPosOrder(o.id)}
+                  className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs border transition-colors ${activePendingOrderId === o.id ? 'bg-primary/20 border-primary/40 text-primary' : 'bg-card border-border text-foreground hover:border-primary/40'}`}
+                >
+                  <span>{o.orderNumber} · ₹{o.total}</span>
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    title="Remove from parked list"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      removePendingPosOrder(o.id);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        removePendingPosOrder(o.id);
+                      }
+                    }}
+                    className="inline-flex items-center justify-center w-4 h-4 rounded-full hover:bg-destructive/15 hover:text-destructive"
+                  >
+                    <X size={10} />
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Mobile order header */}
         <div className="flex lg:hidden items-center justify-between px-4 py-2 border-b border-border">
@@ -994,7 +1386,7 @@ export default function POSBillingClient() {
             <button onClick={sendKOT} disabled={cart.length === 0} className="flex items-center gap-1 px-2 py-1 bg-accent/15 border border-accent/40 text-accent rounded-lg text-xs font-semibold disabled:opacity-50">
               <Printer size={11} /> KOT
             </button>
-            <button onClick={() => setCart([])} className="w-6 h-6 flex items-center justify-center rounded-lg bg-secondary text-muted-foreground hover:text-destructive">
+            <button onClick={startNewClientOrder} className="w-6 h-6 flex items-center justify-center rounded-lg bg-secondary text-muted-foreground hover:text-destructive">
               <RotateCcw size={11} />
             </button>
           </div>
@@ -1307,9 +1699,9 @@ export default function POSBillingClient() {
               <button onClick={() => setShowKotModal(false)} className="flex-1 py-2.5 bg-secondary border border-border rounded-xl text-sm font-semibold text-foreground hover:bg-secondary/80 transition-all">
                 Cancel
               </button>
-              <button onClick={confirmKOT} className="flex-1 py-2.5 bg-accent hover:bg-accent/90 rounded-xl text-sm font-bold text-white flex items-center justify-center gap-2 transition-all">
+              <button onClick={async () => { await createKitchenTicket(); setShowKotModal(false); }} className="flex-1 py-2.5 bg-accent hover:bg-accent/90 rounded-xl text-sm font-bold text-white flex items-center justify-center gap-2 transition-all">
                 <Printer size={14} />
-                {kotPrinterIp ? 'Print KOT' : 'Send KOT'}
+                Send to Kitchen
               </button>
             </div>
           </div>

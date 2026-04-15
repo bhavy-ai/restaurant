@@ -15,6 +15,7 @@ interface UserRole {
   email: string;
   role: 'owner' | 'manager' | 'cashier' | 'captain' | 'kitchen' | 'accountant';
   outlet: string;
+  outlet_id?: string; // New: outlet UUID
   status: 'active' | 'inactive';
   lastLogin: string;
   permissions: string[];
@@ -59,7 +60,8 @@ interface AddUserForm {
   email: string;
   phone: string;
   role: string;
-  outlet: string;
+  outlet: string; // Legacy: outlet name like "koramangala"
+  outlet_id?: string; // New: outlet UUID
 }
 
 interface AddMenuForm {
@@ -91,6 +93,17 @@ interface AggregatorConfig {
   enabled: boolean;
   lastCheckedAt: string | null;
   lastStatus: string;
+}
+
+interface OutletRow {
+  id: string;
+  name: string;
+  slug: string;
+  address?: string;
+  phone?: string;
+  gstin?: string;
+  is_active: boolean;
+  created_at: string;
 }
 
 const roleColors: Record<string, string> = {
@@ -137,21 +150,33 @@ function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean
   );
 }
 
-const defaultAddUserForm: AddUserForm = { name: '', email: '', phone: '', role: 'captain', outlet: 'koramangala' };
+const defaultAddUserForm: AddUserForm = { name: '', email: '', phone: '', role: 'captain', outlet: '', outlet_id: '' };
 const defaultAddMenuForm: AddMenuForm = { name: '', category: 'Starters', price: '', gstRate: '5', hsnCode: '2106', isVeg: true, available: true };
+const PLAN_LIMITS: Record<string, number> = {
+  starter: 1,
+  growth: 3,
+  enterprise: -1,
+};
 
 export default function AdminPanelClient() {
-  const { activeRestaurant } = useAuth();
+  const { activeRestaurant, activeOutlet, switchRestaurant, switchOutlet, isSuperadmin } = useAuth();
   const [activeSection, setActiveSection] = useState<AdminSection>('users');
   const [users, setUsers] = useState<UserRole[]>([]);
   const [menuItems, setMenuItems] = useState<MenuItem[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [outlets, setOutlets] = useState<OutletRow[]>([]);
   const [loadingUsers, setLoadingUsers] = useState(true);
   const [loadingMenu, setLoadingMenu] = useState(false);
   const [loadingAudit, setLoadingAudit] = useState(false);
+  const [loadingOutlets, setLoadingOutlets] = useState(false);
   const [loadingGst, setLoadingGst] = useState(false);
   const [savingGst, setSavingGst] = useState(false);
   const [savingOutlet, setSavingOutlet] = useState(false);
+  const [showAddOutlet, setShowAddOutlet] = useState(false);
+  const [editingOutlet, setEditingOutlet] = useState<OutletRow | null>(null);
+  const [savingNewOutlet, setSavingNewOutlet] = useState(false);
+  const [newOutletForm, setNewOutletForm] = useState({ name: '', slug: '', address: '', phone: '', gstin: '', is_active: true });
+  const [deletingOutletId, setDeletingOutletId] = useState<string | null>(null);
 
   // Audit trail enhanced filters
   const [auditSearch, setAuditSearch] = useState('');
@@ -241,6 +266,12 @@ export default function AdminPanelClient() {
     serviceChargePct: '10',
   });
 
+  const activePlan = (activeRestaurant?.plan || 'starter').toLowerCase();
+  const planLimit = PLAN_LIMITS[activePlan] ?? 1;
+  const activeOutletCount = outlets.length;
+  const isAtOutletLimit = !isSuperadmin && planLimit > 0 && activeOutletCount >= planLimit;
+  const planLimitLabel = planLimit < 0 ? 'Unlimited' : `${activeOutletCount}/${planLimit}`;
+
   // ── Load Users ─────────────────────────────────────────────
   const loadUsers = useCallback(async () => {
     if (!activeRestaurant?.id) {
@@ -261,16 +292,20 @@ export default function AdminPanelClient() {
 
   // ── Load Menu ──────────────────────────────────────────────
   const loadMenu = useCallback(async () => {
+    if (!activeRestaurant?.id) {
+      setMenuItems([]);
+      return;
+    }
     setLoadingMenu(true);
     try {
-      const data = await menuService.getAll();
+      const data = await menuService.getAll(activeOutlet?.slug || 'koramangala', { restaurantId: activeRestaurant.id });
       setMenuItems(data as MenuItem[]);
     } catch (err: any) {
       toast.error('Failed to load menu: ' + err.message);
     } finally {
       setLoadingMenu(false);
     }
-  }, []);
+  }, [activeRestaurant?.id, activeOutlet?.slug]);
 
   // ── Load Audit Logs ────────────────────────────────────────
   const loadAudit = useCallback(async () => {
@@ -307,6 +342,29 @@ export default function AdminPanelClient() {
       console.error('Failed to load outlet settings:', err.message);
     }
   }, []);
+
+  const loadOutlets = useCallback(async () => {
+    if (!activeRestaurant?.id) {
+      setOutlets([]);
+      return;
+    }
+
+    setLoadingOutlets(true);
+    try {
+      const { data, error } = await supabase
+        .from('outlets')
+        .select('*')
+        .eq('restaurant_id', activeRestaurant.id)
+        .order('created_at', { ascending: true });
+
+      if (error) throw error;
+      setOutlets((data || []) as OutletRow[]);
+    } catch (err: any) {
+      toast.error('Failed to load outlets: ' + err.message);
+    } finally {
+      setLoadingOutlets(false);
+    }
+  }, [activeRestaurant?.id]);
 
   // ── Load Printers ──────────────────────────────────────────
   const loadPrinters = useCallback(async () => {
@@ -361,7 +419,8 @@ export default function AdminPanelClient() {
   useEffect(() => {
     loadUsers();
     loadOutletSettings();
-  }, [loadUsers, loadOutletSettings]);
+    loadOutlets();
+  }, [loadUsers, loadOutletSettings, loadOutlets]);
 
   useEffect(() => {
     if (activeSection === 'menu' && menuItems.length === 0) loadMenu();
@@ -430,6 +489,10 @@ export default function AdminPanelClient() {
   }
 
   async function handleAddMenuItem() {
+    if (!activeRestaurant?.id) {
+      toast.error('No active restaurant selected. Please select a restaurant and try again.');
+      return;
+    }
     if (!addMenuForm.name.trim() || !addMenuForm.price) {
       toast.error('Name and price are required');
       return;
@@ -466,7 +529,8 @@ export default function AdminPanelClient() {
           hsnCode: addMenuForm.hsnCode,
           isVeg: addMenuForm.isVeg,
           available: addMenuForm.available,
-        });
+          outlet: activeOutlet?.slug || 'koramangala',
+        }, { restaurantId: activeRestaurant.id });
         setMenuItems((prev) => [...prev, newItem as MenuItem]);
         toast.success(`${addMenuForm.name} added to menu`);
       }
@@ -553,6 +617,7 @@ export default function AdminPanelClient() {
           phone: addUserForm.phone,
           role: addUserForm.role,
           outlet: addUserForm.outlet,
+          outlet_id: addUserForm.outlet_id,
         });
         setUsers((prev) => prev.map((u) => u.id === editingUser.id ? {
           ...u,
@@ -560,6 +625,7 @@ export default function AdminPanelClient() {
           email: addUserForm.email,
           role: addUserForm.role as UserRole['role'],
           outlet: addUserForm.outlet,
+          outlet_id: addUserForm.outlet_id,
         } : u));
         toast.success(`${addUserForm.name} updated`);
       } else {
@@ -569,6 +635,7 @@ export default function AdminPanelClient() {
           phone: addUserForm.phone,
           role: addUserForm.role,
           outlet: addUserForm.outlet,
+          outlet_id: addUserForm.outlet_id,
         }, { restaurantId: activeRestaurant.id });
         setUsers((prev) => [...prev, newUser as UserRole]);
         toast.success(`${addUserForm.name} added — credentials sent via SMS`);
@@ -577,7 +644,7 @@ export default function AdminPanelClient() {
           staffRole: 'owner',
           action: 'USER_CREATED',
           entity: addUserForm.name,
-          details: `New ${addUserForm.role} account created for ${addUserForm.outlet} outlet`,
+          details: `New ${addUserForm.role} account created for ${addUserForm.outlet_id ? 'outlet ' + outlets.find(o => o.id === addUserForm.outlet_id)?.name : 'global'} assignment`,
           severity: 'info',
           outlet: 'koramangala',
         });
@@ -599,7 +666,8 @@ export default function AdminPanelClient() {
       email: user.email,
       phone: '',
       role: user.role,
-      outlet: user.outlet,
+      outlet: user.outlet || '',
+      outlet_id: user.outlet_id || '',
     });
     setShowAddUser(true);
   }
@@ -614,6 +682,99 @@ export default function AdminPanelClient() {
       toast.error('Failed to save: ' + err.message);
     } finally {
       setSavingOutlet(false);
+    }
+  }
+
+  function openAddOutlet() {
+    setEditingOutlet(null);
+    setNewOutletForm({ name: '', slug: '', address: '', phone: '', gstin: '', is_active: true });
+    setShowAddOutlet(true);
+  }
+
+  function openEditOutlet(outlet: OutletRow) {
+    setEditingOutlet(outlet);
+    setNewOutletForm({
+      name: outlet.name,
+      slug: outlet.slug,
+      address: outlet.address || '',
+      phone: outlet.phone || '',
+      gstin: outlet.gstin || '',
+      is_active: outlet.is_active,
+    });
+    setShowAddOutlet(true);
+  }
+
+  async function saveOutlet() {
+    if (!activeRestaurant?.id) {
+      toast.error('No active restaurant selected');
+      return;
+    }
+    if (!newOutletForm.name.trim()) {
+      toast.error('Outlet name is required');
+      return;
+    }
+
+    setSavingNewOutlet(true);
+    try {
+      const method = editingOutlet ? 'PATCH' : 'POST';
+      const response = await fetch('/api/admin/outlets', {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          restaurantId: activeRestaurant.id,
+          outletId: editingOutlet?.id,
+          name: newOutletForm.name,
+          slug: newOutletForm.slug,
+          address: newOutletForm.address,
+          phone: newOutletForm.phone,
+          gstin: newOutletForm.gstin,
+          is_active: newOutletForm.is_active,
+        }),
+      });
+
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result?.error || `Failed to ${editingOutlet ? 'update' : 'create'} outlet`);
+      }
+
+      toast.success(`Outlet "${newOutletForm.name}" ${editingOutlet ? 'updated' : 'created'}`);
+      setShowAddOutlet(false);
+      setEditingOutlet(null);
+      setNewOutletForm({ name: '', slug: '', address: '', phone: '', gstin: '', is_active: true });
+      await loadOutlets();
+      await switchRestaurant(activeRestaurant.id);
+    } catch (err: any) {
+      toast.error(err?.message || `Failed to ${editingOutlet ? 'update' : 'create'} outlet`);
+    } finally {
+      setSavingNewOutlet(false);
+    }
+  }
+
+  async function deleteOutlet(outlet: OutletRow) {
+    if (!activeRestaurant?.id) return;
+    const confirmed = window.confirm(`Soft delete "${outlet.name}"? This will mark the outlet inactive.`);
+    if (!confirmed) return;
+
+    setDeletingOutletId(outlet.id);
+    try {
+      const response = await fetch('/api/admin/outlets', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ restaurantId: activeRestaurant.id, outletId: outlet.id }),
+      });
+
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result?.error || 'Failed to delete outlet');
+      }
+
+      toast.success(`Outlet "${outlet.name}" deactivated`);
+      await loadOutlets();
+      await switchRestaurant(activeRestaurant.id);
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to delete outlet');
+    } finally {
+      setDeletingOutletId(null);
     }
   }
 
@@ -908,6 +1069,172 @@ export default function AdminPanelClient() {
             <h2 className="text-base font-bold text-foreground mb-1">Outlet Configuration</h2>
             <p className="text-xs text-muted-foreground mb-5">Legal and operational details for this outlet</p>
             <div className="space-y-5">
+              <div className="bg-card border border-border rounded-2xl p-5">
+                <div className="flex items-center justify-between gap-3 mb-4">
+                  <div>
+                    <h3 className="text-sm font-bold text-foreground">Outlets</h3>
+                    <p className="text-xs text-muted-foreground">Create and manage outlets for the active restaurant</p>
+                    <p className="text-[11px] text-muted-foreground mt-1">
+                      Plan: <span className="font-semibold text-foreground capitalize">{activePlan}</span> · Outlets used: <span className="font-semibold text-foreground">{planLimitLabel}</span>
+                      {isSuperadmin ? ' · Superadmin can bypass plan limits' : ''}
+                    </p>
+                  </div>
+                  <button
+                    onClick={openAddOutlet}
+                    disabled={isAtOutletLimit}
+                    className="flex items-center gap-1.5 px-3 py-2 bg-primary hover:bg-primary/90 text-white rounded-xl text-sm font-semibold transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <Plus size={14} />
+                    {isAtOutletLimit ? 'Plan Limit Reached' : 'Add Outlet'}
+                  </button>
+                </div>
+
+                {isAtOutletLimit && (
+                  <div className="mb-4 rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-xs text-amber-300">
+                    This plan already uses all active outlet slots. Upgrade the plan to add more outlets, or ask a superadmin to create an outlet on your behalf.
+                  </div>
+                )}
+
+                {showAddOutlet && (
+                  <div className="mb-5 p-4 rounded-2xl border border-border bg-secondary/20 space-y-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <h4 className="text-sm font-bold text-foreground">{editingOutlet ? 'Edit Outlet' : 'Add Outlet'}</h4>
+                        <p className="text-[11px] text-muted-foreground">{editingOutlet ? 'Update outlet details or reactivate it' : 'Create a new outlet for this restaurant'}</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => { setShowAddOutlet(false); setEditingOutlet(null); setNewOutletForm({ name: '', slug: '', address: '', phone: '', gstin: '', is_active: true }); }}
+                        className="text-muted-foreground hover:text-foreground transition-colors"
+                      >
+                        <X size={16} />
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-xs font-semibold text-muted-foreground mb-1">Outlet Name <span className="text-red-500">*</span></label>
+                        <input
+                          value={newOutletForm.name}
+                          onChange={(e) => setNewOutletForm((s) => ({ ...s, name: e.target.value }))}
+                          placeholder="Main Branch"
+                          className="w-full bg-card border border-border rounded-xl px-3 py-2 text-sm text-foreground focus:outline-none focus:border-primary/60 transition-colors"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold text-muted-foreground mb-1">Slug</label>
+                        <input
+                          value={newOutletForm.slug}
+                          onChange={(e) => setNewOutletForm((s) => ({ ...s, slug: e.target.value }))}
+                          placeholder="main-branch"
+                          className="w-full bg-card border border-border rounded-xl px-3 py-2 text-sm text-foreground focus:outline-none focus:border-primary/60 transition-colors"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold text-muted-foreground mb-1">Phone</label>
+                        <input
+                          value={newOutletForm.phone}
+                          onChange={(e) => setNewOutletForm((s) => ({ ...s, phone: e.target.value }))}
+                          placeholder="+91 98765 43210"
+                          className="w-full bg-card border border-border rounded-xl px-3 py-2 text-sm text-foreground focus:outline-none focus:border-primary/60 transition-colors"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold text-muted-foreground mb-1">GSTIN</label>
+                        <input
+                          value={newOutletForm.gstin}
+                          onChange={(e) => setNewOutletForm((s) => ({ ...s, gstin: e.target.value }))}
+                          placeholder="29AABCS1429B1Z1"
+                          className="w-full bg-card border border-border rounded-xl px-3 py-2 text-sm text-foreground focus:outline-none focus:border-primary/60 transition-colors"
+                        />
+                      </div>
+                      <div className="sm:col-span-2">
+                        <label className="block text-xs font-semibold text-muted-foreground mb-1">Address</label>
+                        <textarea
+                          value={newOutletForm.address}
+                          onChange={(e) => setNewOutletForm((s) => ({ ...s, address: e.target.value }))}
+                          rows={2}
+                          placeholder="Outlet address"
+                          className="w-full bg-card border border-border rounded-xl px-3 py-2 text-sm text-foreground focus:outline-none focus:border-primary/60 transition-colors resize-none"
+                        />
+                      </div>
+                      <div className="sm:col-span-2 flex items-center justify-between rounded-xl border border-border bg-card px-3 py-2.5">
+                        <div>
+                          <p className="text-xs font-semibold text-foreground">Active</p>
+                          <p className="text-[11px] text-muted-foreground">Inactive outlets stay hidden from the sidebar</p>
+                        </div>
+                        <Toggle enabled={newOutletForm.is_active} onChange={(v) => setNewOutletForm((s) => ({ ...s, is_active: v }))} />
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={saveOutlet}
+                        disabled={savingNewOutlet}
+                        className="flex items-center gap-2 px-4 py-2 bg-primary hover:bg-primary/90 text-white font-semibold text-sm rounded-xl transition-all active:scale-95 disabled:opacity-60"
+                      >
+                        {savingNewOutlet ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                        {savingNewOutlet ? 'Saving…' : editingOutlet ? 'Update Outlet' : 'Create Outlet'}
+                      </button>
+                      <button
+                        onClick={() => { setShowAddOutlet(false); setEditingOutlet(null); setNewOutletForm({ name: '', slug: '', address: '', phone: '', gstin: '', is_active: true }); }}
+                        className="px-4 py-2 rounded-xl border border-border text-sm font-semibold text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {loadingOutlets ? (
+                  <div className="flex items-center justify-center py-8">
+                    <Loader2 size={20} className="animate-spin text-primary" />
+                  </div>
+                ) : outlets.length === 0 ? (
+                  <div className="text-sm text-muted-foreground py-3">No outlets found for this restaurant.</div>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {outlets.map((outlet) => (
+                      <div key={outlet.id} className="rounded-xl border border-border bg-secondary/20 p-4">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <p className="text-sm font-semibold text-foreground">{outlet.name}</p>
+                            <p className="text-[11px] text-muted-foreground font-mono mt-0.5">{outlet.slug}</p>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${outlet.is_active ? 'bg-green-500/10 text-green-400 border-green-500/20' : 'bg-red-500/10 text-red-400 border-red-500/20'}`}>
+                              {outlet.is_active ? 'Active' : 'Inactive'}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => openEditOutlet(outlet)}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-border bg-card text-[11px] font-semibold text-muted-foreground hover:text-foreground hover:border-primary/40 transition-colors"
+                              title="Edit outlet"
+                            >
+                              <Edit3 size={12} />
+                              Edit
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => deleteOutlet(outlet)}
+                              disabled={deletingOutletId === outlet.id}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-border bg-card text-[11px] font-semibold text-muted-foreground hover:text-red-400 hover:border-red-500/30 transition-colors disabled:opacity-50"
+                              title="Soft delete outlet"
+                            >
+                              {deletingOutletId === outlet.id ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                        {outlet.address && <p className="text-xs text-muted-foreground mt-3">{outlet.address}</p>}
+                        <div className="flex flex-wrap gap-2 mt-3 text-[11px] text-muted-foreground">
+                          {outlet.phone && <span className="px-2 py-1 rounded-full bg-card border border-border">{outlet.phone}</span>}
+                          {outlet.gstin && <span className="px-2 py-1 rounded-full bg-card border border-border">GSTIN {outlet.gstin}</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
               <div className="bg-card border border-border rounded-2xl p-5">
                 <h3 className="text-sm font-bold text-foreground mb-4">Basic Information</h3>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -1878,16 +2205,30 @@ export default function AdminPanelClient() {
                 </select>
               </div>
               <div>
-                <label className="block text-xs font-semibold text-muted-foreground mb-1">Outlet Access</label>
+                <label className="block text-xs font-semibold text-muted-foreground mb-1">Outlet Assignment</label>
                 <select
-                  value={addUserForm.outlet}
-                  onChange={(e) => setAddUserForm((f) => ({ ...f, outlet: e.target.value }))}
+                  value={addUserForm.outlet_id || ''}
+                  onChange={(e) => {
+                    const selectedId = e.target.value;
+                    const selectedOutlet = outlets.find(o => o.id === selectedId);
+                    setAddUserForm((f) => ({
+                      ...f,
+                      outlet_id: selectedId,
+                      outlet: selectedOutlet?.slug || selectedOutlet?.name || '',
+                    }));
+                  }}
                   className="w-full bg-secondary border border-border rounded-xl px-3 py-2.5 text-sm text-foreground focus:outline-none focus:border-primary/60 transition-colors"
                 >
-                  <option value="koramangala">Koramangala</option>
-                  <option value="indiranagar">Indiranagar</option>
-                  <option value="All Outlets">All Outlets</option>
+                  <option value="">— No specific outlet (global access) —</option>
+                  {outlets.map((outlet) => (
+                    <option key={outlet.id} value={outlet.id}>
+                      {outlet.name} {outlet.address ? `(${outlet.address})` : ''}
+                    </option>
+                  ))}
                 </select>
+                <p className="text-xs text-muted-foreground mt-1">
+                  {addUserForm.outlet_id ? 'Staff restricted to selected outlet only' : 'Staff can access all outlets in this restaurant'}
+                </p>
               </div>
             </div>
             <div className="flex gap-2">

@@ -74,7 +74,7 @@ export default function LoginPage() {
       <div className="w-full max-w-sm">
         {/* Logo */}
         <div className="flex justify-center mb-8">
-          <AppLogo className="h-10 w-auto" />
+          <AppLogo size={40} />
         </div>
 
         <div className="bg-card border border-border rounded-2xl p-8 shadow-lg">

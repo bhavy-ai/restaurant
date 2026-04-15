@@ -58,8 +58,9 @@ const COLORS = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4'
 
 export default function ReportsClient() {
   const supabase = createClient();
-  const { activeRestaurant, accessibleRestaurants } = useAuth();
+  const { activeRestaurant, activeOutlet, accessibleRestaurants } = useAuth();
   const isMultiRestaurant = accessibleRestaurants.length > 1;
+  const outletSlug = activeOutlet?.slug || 'koramangala';
 
   const [activeTab, setActiveTab] = useState<ReportTab>('sales');
   const [dateRange, setDateRange] = useState<'today' | '7d' | '30d'>('7d');
@@ -97,7 +98,7 @@ export default function ReportsClient() {
       if (restaurantId) {
         billsQuery = billsQuery.eq('restaurant_id', restaurantId);
       } else {
-        billsQuery = billsQuery.eq('outlet', 'koramangala');
+        billsQuery = billsQuery.eq('outlet', outletSlug);
       }
 
       const { data: bills, error: billsError } = await billsQuery;
@@ -134,16 +135,19 @@ export default function ReportsClient() {
       })));
 
       // ── Category breakdown ──
-      const { data: orderItems } = await supabase
-        .from('order_items')
-        .select('name, price, qty, menu_item_id')
-        .gte('created_at', since);
+      const activeBillIds = activeBills.map((b: any) => b.id).filter(Boolean);
+      const { data: orderItems } = activeBillIds.length > 0
+        ? await supabase
+            .from('order_items')
+            .select('name, price, qty, menu_item_id, order_id')
+            .in('order_id', activeBillIds)
+        : { data: [] as any[] };
 
       let menuQuery = supabase.from('menu_items').select('id, category');
       if (restaurantId) {
         menuQuery = menuQuery.eq('restaurant_id', restaurantId);
       } else {
-        menuQuery = menuQuery.eq('outlet', 'koramangala');
+        menuQuery = menuQuery.eq('outlet', outletSlug);
       }
       const { data: menuItemsData } = await menuQuery;
 
@@ -164,7 +168,7 @@ export default function ReportsClient() {
       if (restaurantId) {
         menuGstQuery = menuGstQuery.eq('restaurant_id', restaurantId);
       } else {
-        menuGstQuery = menuGstQuery.eq('outlet', 'koramangala');
+        menuGstQuery = menuGstQuery.eq('outlet', outletSlug);
       }
       const { data: menuItemsGst } = await menuGstQuery;
 
@@ -238,7 +242,7 @@ export default function ReportsClient() {
       if (restaurantId) {
         auditQuery = auditQuery.eq('restaurant_id', restaurantId);
       } else {
-        auditQuery = auditQuery.eq('outlet', 'koramangala');
+        auditQuery = auditQuery.eq('outlet', outletSlug);
       }
       const { data: auditLogs } = await auditQuery;
 
@@ -296,7 +300,7 @@ export default function ReportsClient() {
     } finally {
       setLoading(false);
     }
-  }, [dateRange, getDateFilter, activeRestaurant, accessibleRestaurants, isMultiRestaurant]);
+  }, [dateRange, getDateFilter, activeRestaurant, accessibleRestaurants, isMultiRestaurant, outletSlug]);
 
   useEffect(() => { loadReports(); }, [loadReports]);
 

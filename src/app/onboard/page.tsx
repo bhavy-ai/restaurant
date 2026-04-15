@@ -41,6 +41,7 @@ const STEPS = [
 export default function OnboardPage() {
   const router = useRouter();
   const { user, loading, signUp, signIn } = useAuth();
+  const supabase = createClient();
 
   const [step, setStep] = useState(1);
   const [submitting, setSubmitting] = useState(false);
@@ -97,6 +98,23 @@ export default function OnboardPage() {
       .eq('is_active', true);
 
     if ((count || 0) > 0) {
+      router.push('/table-management');
+      return true;
+    }
+
+    const { count: ownedCount } = await supabase
+      .from('restaurants')
+      .select('id', { head: true, count: 'exact' })
+      .eq('owner_user_id', userId)
+      .eq('is_active', true);
+
+    const { count: createdCount } = await supabase
+      .from('restaurants')
+      .select('id', { head: true, count: 'exact' })
+      .eq('created_by_user_id', userId)
+      .eq('is_active', true);
+
+    if ((ownedCount || 0) > 0 || (createdCount || 0) > 0) {
       router.push('/table-management');
       return true;
     }
@@ -212,13 +230,14 @@ export default function OnboardPage() {
       if (outletError) throw outletError;
 
       // 3. Grant owner access
-      await supabase.from('user_restaurant_access').insert({
+      const { error: accessError } = await supabase.from('user_restaurant_access').insert({
         user_id: currentUser.id,
         restaurant_id: restaurant.id,
         outlet_id: outlet.id,
         role: 'owner',
         is_active: true,
       });
+      if (accessError) throw accessError;
 
       // 4. Redirect to POS
       router.push('/pos-billing');

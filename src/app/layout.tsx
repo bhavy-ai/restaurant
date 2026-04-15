@@ -10,7 +10,7 @@ export const viewport: Viewport = {
 };
 
 export const metadata: Metadata = {
-  title: 'RestroOS — Restaurant Operating System for India',
+  title: 'RestroOS - Restaurant Operating System for India',
   description:
     'RestroOS unifies POS billing, kitchen display, table management, inventory, GST compliance, and EOD settlement for Indian restaurants.',
   icons: {
@@ -38,7 +38,7 @@ export default function RootLayout({
             },
           }}
         />
-</body>
+      </body>
     </html>
   );
 }

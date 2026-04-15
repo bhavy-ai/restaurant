@@ -4,6 +4,7 @@
 CREATE TABLE IF NOT EXISTS public.printer_config (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   outlet TEXT NOT NULL,
+  restaurant_id UUID REFERENCES public.restaurants(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   printer_type TEXT NOT NULL DEFAULT 'bill',
   ip_address TEXT NOT NULL DEFAULT '',
@@ -25,6 +26,7 @@ CREATE POLICY "printer_config_open_access" ON public.printer_config FOR ALL TO p
 CREATE TABLE IF NOT EXISTS public.aggregator_config (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   outlet TEXT NOT NULL,
+  tenant_restaurant_id UUID REFERENCES public.restaurants(id) ON DELETE CASCADE,
   platform TEXT NOT NULL,
   display_name TEXT NOT NULL,
   api_key TEXT NOT NULL DEFAULT '',
@@ -48,19 +50,19 @@ CREATE POLICY "aggregator_config_open_access" ON public.aggregator_config FOR AL
 DO $$
 BEGIN
   -- Seed printer configs
-  INSERT INTO public.printer_config (outlet, name, printer_type, ip_address, port, paper_width, enabled)
+  INSERT INTO public.printer_config (outlet, restaurant_id, name, printer_type, ip_address, port, paper_width, enabled)
   VALUES
-    ('koramangala', 'Billing Counter — Epson TM-T82', 'bill', '192.168.1.50', 9100, '80mm', true),
-    ('koramangala', 'Main Kitchen — Star TSP143', 'kot', '192.168.1.51', 9100, '80mm', true),
-    ('koramangala', 'Bar Counter — Epson TM-T82', 'kot', '192.168.1.52', 9100, '58mm', false),
-    ('koramangala', 'Grill Station — Star TSP143', 'kot', '192.168.1.53', 9100, '80mm', true)
+    ('koramangala', (SELECT id FROM public.restaurants ORDER BY created_at ASC LIMIT 1), 'Billing Counter — Epson TM-T82', 'bill', '192.168.1.50', 9100, '80mm', true),
+    ('koramangala', (SELECT id FROM public.restaurants ORDER BY created_at ASC LIMIT 1), 'Main Kitchen — Star TSP143', 'kot', '192.168.1.51', 9100, '80mm', true),
+    ('koramangala', (SELECT id FROM public.restaurants ORDER BY created_at ASC LIMIT 1), 'Bar Counter — Epson TM-T82', 'kot', '192.168.1.52', 9100, '58mm', false),
+    ('koramangala', (SELECT id FROM public.restaurants ORDER BY created_at ASC LIMIT 1), 'Grill Station — Star TSP143', 'kot', '192.168.1.53', 9100, '80mm', true)
   ON CONFLICT DO NOTHING;
 
   -- Seed aggregator configs
-  INSERT INTO public.aggregator_config (outlet, platform, display_name, api_key, restaurant_id, enabled, last_status)
+  INSERT INTO public.aggregator_config (outlet, tenant_restaurant_id, platform, display_name, api_key, restaurant_id, enabled, last_status)
   VALUES
-    ('koramangala', 'zomato', 'Zomato for Restaurants', '', '', false, 'unchecked'),
-    ('koramangala', 'swiggy', 'Swiggy Partner', '', '', false, 'unchecked')
+    ('koramangala', (SELECT id FROM public.restaurants ORDER BY created_at ASC LIMIT 1), 'zomato', 'Zomato for Restaurants', '', '', false, 'unchecked'),
+    ('koramangala', (SELECT id FROM public.restaurants ORDER BY created_at ASC LIMIT 1), 'swiggy', 'Swiggy Partner', '', '', false, 'unchecked')
   ON CONFLICT (outlet, platform) DO NOTHING;
 EXCEPTION
   WHEN OTHERS THEN

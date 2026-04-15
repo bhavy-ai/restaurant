@@ -11,6 +11,7 @@ import { useNetworkStatus } from '@/hooks/useNetworkStatus';
 import SyncStatusPanel from './SyncStatusPanel';
 import PostSyncVerification from './PostSyncVerification';
 import ShiftHandover from '@/components/ShiftHandover';
+import { useAuth } from '@/contexts/AuthContext';
 
 interface Bill {
   id: string;
@@ -180,18 +181,77 @@ export default function SettlementClient() {
 
   const networkStatus = useNetworkStatus();
   const supabase = createClient();
+  const { activeRestaurant, activeOutlet, staffUser } = useAuth();
+  const restaurantId = activeRestaurant?.id;
+  const outletSlug = activeOutlet?.slug || staffUser?.outlet || 'koramangala';
+
+  const computeStatsFromBills = useCallback((rawBills: Bill[], cashierName: string): ShiftStats => {
+    const settledBills = rawBills.filter((b) => b.status === 'settled');
+    const voidedBills = rawBills.filter((b) => b.status === 'voided');
+    const grossSales = settledBills.reduce((s, b) => s + b.gross, 0);
+    const discounts = settledBills.reduce((s, b) => s + b.discount, 0);
+    const totalGst = settledBills.reduce((s, b) => s + b.gst, 0);
+    const netSales = settledBills.reduce((s, b) => s + b.net, 0);
+    const totalBills = settledBills.length;
+    const totalCovers = settledBills.reduce((s, b) => s + (b.covers || 0), 0);
+    const paymentSum = (mode: 'cash' | 'upi' | 'card') =>
+      settledBills
+        .filter((b) => (b.paymentMode || '').toLowerCase() === mode)
+        .reduce((s, b) => s + b.net, 0);
+
+    return {
+      shiftName: 'Today Summary',
+      shiftDate: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }),
+      openedAt: '--',
+      cashier: cashierName,
+      openingFloat: 0,
+      totalBills,
+      totalCovers,
+      grossSales: Math.round(grossSales),
+      discounts: Math.round(discounts),
+      voids: Math.round(voidedBills.reduce((s, b) => s + b.net, 0)),
+      netSales: Math.round(netSales),
+      cashSales: Math.round(paymentSum('cash')),
+      upiSales: Math.round(paymentSum('upi')),
+      cardSales: Math.round(paymentSum('card')),
+      cgst: Math.round(totalGst / 2),
+      sgst: Math.round(totalGst / 2),
+      totalGst: Math.round(totalGst),
+      avgBillValue: totalBills > 0 ? Math.round(netSales / totalBills) : 0,
+      avgCoverValue: totalCovers > 0 ? Math.round(netSales / totalCovers) : 0,
+    };
+  }, []);
 
   const loadData = useCallback(async () => {
+    if (!restaurantId) {
+      setBills([]);
+      setShiftStats(null);
+      setActiveShift(null);
+      setLoading(false);
+      return;
+    }
     try {
-      const shift = await shiftService.getActive();
+      const shift = await shiftService.getActive(outletSlug, { restaurantId, outletSlug });
       if (shift) {
         setActiveShift(shift);
-        const [billsData, stats] = await Promise.all([
-          billService.getByShift(shift.id),
-          shiftService.getStats(shift.id),
+        const [billsData, stats, todayBills] = await Promise.all([
+          billService.getByShift(shift.id, { restaurantId, outletSlug }),
+          shiftService.getStats(shift.id, { restaurantId, outletSlug }),
+          billService.getToday(outletSlug, { restaurantId, outletSlug }),
         ]);
-        setBills(billsData as Bill[]);
-        if (stats) {
+        const shiftBills = billsData as Bill[];
+        const combinedBills = Array.from(
+          new Map([
+            ...shiftBills,
+            ...(todayBills as Bill[]),
+          ].map((bill) => [bill.id, bill])).values(),
+        );
+
+        setBills(combinedBills);
+
+        if (combinedBills.length > 0) {
+          setShiftStats(computeStatsFromBills(combinedBills, shift.cashier || staffUser?.name || 'System'));
+        } else if (stats && shiftBills.length > 0) {
           setShiftStats({
             shiftName: shift.shift_name,
             shiftDate: new Date(shift.shift_date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }),
@@ -201,13 +261,50 @@ export default function SettlementClient() {
             ...stats,
           });
         }
+      } else {
+        setActiveShift(null);
+        let todayBills = await billService.getToday(outletSlug, { restaurantId, outletSlug });
+
+        // Fallback for legacy bills saved without correct outlet slug.
+        if (!todayBills || todayBills.length === 0) {
+          const today = new Date();
+          today.setHours(0, 0, 0, 0);
+          const { data: crossOutletRows } = await supabase
+            .from('bills')
+            .select('*')
+            .eq('restaurant_id', restaurantId)
+            .gte('created_at', today.toISOString())
+            .order('created_at', { ascending: false });
+
+          todayBills = (crossOutletRows || []).map((r: any) => ({
+            id: r.id,
+            billNo: r.bill_number,
+            tableLabel: r.table_label,
+            time: new Date(r.created_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false }),
+            items: r.items_count,
+            covers: r.covers,
+            gross: Number(r.gross_amount),
+            discount: Number(r.discount_amt),
+            gst: Number(r.gst_amount),
+            net: Number(r.net_amount),
+            paymentMode: r.payment_mode?.charAt(0).toUpperCase() + r.payment_mode?.slice(1) || 'UPI',
+            cashier: r.cashier,
+            status: r.status,
+            stripeStatus: r.stripe_status ?? null,
+            stripeReceiptUrl: r.stripe_receipt_url ?? null,
+          })) as any;
+        }
+
+        setBills(todayBills as Bill[]);
+
+        setShiftStats(computeStatsFromBills(todayBills as Bill[], staffUser?.name || 'System'));
       }
     } catch (err: any) {
       toast.error('Failed to load settlement data: ' + err.message);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [restaurantId, outletSlug, staffUser?.name, computeStatsFromBills]);
 
   useEffect(() => {
     loadData();
@@ -254,6 +351,7 @@ export default function SettlementClient() {
       .channel('settlement_bills')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'bills' }, (payload) => {
         const r = payload.new;
+        if (r.restaurant_id !== restaurantId || r.outlet !== outletSlug) return;
         const newBill: Bill = {
           id: r.id,
           billNo: r.bill_number,
@@ -272,13 +370,14 @@ export default function SettlementClient() {
         setBills((prev) => [newBill, ...prev]);
         // Refresh stats
         if (activeShift) {
-          shiftService.getStats(activeShift.id).then((stats) => {
+          shiftService.getStats(activeShift.id, { restaurantId: restaurantId || '', outletSlug }).then((stats) => {
             if (stats) setShiftStats((prev) => prev ? { ...prev, ...stats } : prev);
           });
         }
       })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'bills' }, (payload) => {
         const r = payload.new;
+        if (r.restaurant_id !== restaurantId || r.outlet !== outletSlug) return;
         setBills((prev) =>
           prev.map((b) => b.id === r.id ? {
             ...b,
@@ -314,7 +413,7 @@ export default function SettlementClient() {
       .subscribe();
 
     return () => { supabase.removeChannel(channel); };
-  }, [activeShift, startRetryCountdown]);
+  }, [activeShift, startRetryCountdown, restaurantId, outletSlug]);
 
   const summary = shiftStats || {
     shiftName: 'Lunch Shift', shiftDate: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }),
@@ -386,7 +485,8 @@ export default function SettlementClient() {
       const { data: config } = await supabaseClient
         .from('notification_config')
         .select('*')
-        .eq('outlet', 'koramangala')
+        .eq('outlet', outletSlug)
+        .eq('restaurant_id', restaurantId || '')
         .eq('provider', 'twilio')
         .single();
 

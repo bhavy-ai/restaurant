@@ -3,7 +3,7 @@
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export type QueueOperationType =
-  | 'order_create' |'order_add_items' |'order_update_totals' |'order_update_status' |'table_seat' |'table_request_bill' |'table_mark_cleaning' |'table_mark_available' |'table_assign_captain' |'inventory_adjust' |'bill_create';
+  | 'order_create' |'order_add_items' |'order_update_totals' |'order_update_status' |'takeaway_create' |'takeaway_cancel' |'kot_create' |'kot_void' |'table_seat' |'table_request_bill' |'table_mark_cleaning' |'table_mark_available' |'table_assign_captain' |'inventory_adjust' |'bill_create';
 
 export type QueueItemStatus = 'pending' | 'syncing' | 'synced' | 'failed' | 'conflict';
 
@@ -194,12 +194,80 @@ class OfflineQueueManager {
   /** Execute a single queue item against Supabase */
   private async executeItem(item: QueueItem): Promise<void> {
     // Dynamic import to avoid circular deps
-    const { tableService, orderService, inventoryService, billService } =
+    const { tableService, orderService, inventoryService, billService, kotService } =
       await import('@/lib/services/restaurantService');
+    const supabase = (await import('@/lib/supabase/client')).createClient();
 
     const p = item.payload;
 
     switch (item.type) {
+      case 'takeaway_create': {
+        const takeawayTable = supabase.from('takeaway_orders') as any;
+        const { data: orderRow, error: orderError } = await takeawayTable.insert({
+          restaurant_id: p.restaurantId || p.restaurant_id || null,
+          outlet: p.outlet || 'koramangala',
+          order_number: p.orderNumber,
+          order_type: p.orderType || 'takeaway',
+          aggregator: p.aggregator || null,
+          aggregator_order_id: p.aggregatorOrderId || null,
+          customer_name: p.customerName || null,
+          customer_phone: p.customerPhone || null,
+          delivery_address: p.deliveryAddress || null,
+          items: p.items || [],
+          subtotal: p.subtotal || 0,
+          gst_amount: p.gstAmount || 0,
+          discount_amount: p.discountAmount || 0,
+          total: p.total || 0,
+          payment_mode: p.paymentMode || 'cash',
+          status: p.status || 'pending',
+          assigned_rider: p.assignedRider || null,
+          estimated_time: p.estimatedTime || 30,
+          notes: p.notes || null,
+        }).select('id').single();
+        if (orderError) throw orderError;
+
+        const kotPayload = {
+          kotNumber: `KOT-${p.orderNumber}`,
+          orderId: orderRow?.id,
+          tableLabel: p.orderType === 'delivery' ? 'DEL' : 'TKW',
+          orderType: p.orderType || 'takeaway',
+          station: 'Main Kitchen',
+          priority: 'normal',
+          steward: 'Counter',
+          covers: 0,
+          outlet: p.outlet || 'koramangala',
+          items: (p.items || []).map((item: any) => ({
+            menuItemId: item.menuItemId,
+            name: item.name,
+            qty: item.qty,
+            note: item.note,
+            isVeg: item.isVeg ?? false,
+          })),
+        };
+        await kotService.create(kotPayload as any, p.restaurantId ? { restaurantId: p.restaurantId, outletSlug: p.outlet } : undefined);
+        break;
+      }
+      case 'takeaway_cancel': {
+        const orderId = p.orderId;
+        if (!orderId) break;
+        const cancelPayload: Record<string, any> = {
+          status: 'cancelled',
+          updated_at: new Date().toISOString(),
+        };
+        await (supabase.from('takeaway_orders') as any).update(cancelPayload).eq('id', orderId);
+        await (supabase.from('kots') as any).update({ status: 'voided' }).eq('order_id', orderId);
+        break;
+      }
+      case 'kot_create':
+        await kotService.create(p as any, p.restaurantId ? { restaurantId: p.restaurantId, outletSlug: p.outletSlug || p.outlet } : undefined);
+        break;
+      case 'kot_void':
+        if (p.orderId) {
+          await (supabase.from('kots') as any).update({ status: 'voided' }).eq('order_id', p.orderId);
+        } else {
+          await kotService.void(p.kotId);
+        }
+        break;
       case 'table_seat':
         await tableService.seat(p.id, p.captain, p.covers);
         break;
@@ -231,7 +299,10 @@ class OfflineQueueManager {
         await inventoryService.adjust(p.itemId, p.type, p.qty, p.reason, p.adjustedBy);
         break;
       case 'bill_create':
-        await billService.create(p as any);
+        await billService.create(
+          p as any,
+          p.restaurantId ? { restaurantId: p.restaurantId, outletSlug: p.outletSlug || p.outlet } : undefined,
+        );
         break;
       default:
         throw new Error(`Unknown operation type: ${item.type}`);

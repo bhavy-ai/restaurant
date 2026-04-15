@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useCallback } from 'react';
+import { toast } from 'sonner';
 import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/contexts/AuthContext';
 import { Building2, Search, Plus, Check, X, ChevronDown, RefreshCw, AlertCircle, Loader2, ToggleLeft, ToggleRight, MapPin, TrendingUp, Shield, Utensils, ShieldOff, ClipboardList, Receipt, CalendarClock, Pencil, LogOut, Trash2 } from 'lucide-react';
@@ -71,6 +72,11 @@ export default function SuperadminClient() {
   const [selected, setSelected] = useState<Restaurant | null>(null);
   const [outlets, setOutlets] = useState<Outlet[]>([]);
   const [outletsLoading, setOutletsLoading] = useState(false);
+  const [editingOutlet, setEditingOutlet] = useState<Outlet | null>(null);
+  const [showOutletEdit, setShowOutletEdit] = useState(false);
+  const [outletForm, setOutletForm] = useState({ name: '', address: '', is_active: true });
+  const [savingOutlet, setSavingOutlet] = useState(false);
+  const [deletingOutletId, setDeletingOutletId] = useState<string | null>(null);
 
   // Add restaurant modal
   const [showAdd, setShowAdd] = useState(false);
@@ -200,6 +206,80 @@ export default function SuperadminClient() {
     loadOutlets(r.id);
   };
 
+  const openEditOutlet = (outlet: Outlet) => {
+    setEditingOutlet(outlet);
+    setOutletForm({
+      name: outlet.name,
+      address: outlet.address || '',
+      is_active: outlet.is_active,
+    });
+    setShowOutletEdit(true);
+  };
+
+  const saveOutlet = async () => {
+    if (!selected || !editingOutlet) return;
+    if (!outletForm.name.trim()) {
+      toast.error('Outlet name is required');
+      return;
+    }
+
+    setSavingOutlet(true);
+    try {
+      const response = await fetch('/api/admin/outlets', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          restaurantId: selected.id,
+          outletId: editingOutlet.id,
+          name: outletForm.name,
+          address: outletForm.address,
+          is_active: outletForm.is_active,
+        }),
+      });
+
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result?.error || 'Failed to update outlet');
+      }
+
+      toast.success(`Outlet "${outletForm.name}" updated`);
+      setShowOutletEdit(false);
+      setEditingOutlet(null);
+      await loadOutlets(selected.id);
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to update outlet');
+    } finally {
+      setSavingOutlet(false);
+    }
+  };
+
+  const softDeleteOutlet = async (outlet: Outlet) => {
+    if (!selected) return;
+    const ok = window.confirm(`Soft delete "${outlet.name}"? This will mark the outlet inactive.`);
+    if (!ok) return;
+
+    setDeletingOutletId(outlet.id);
+    try {
+      const response = await fetch('/api/admin/outlets', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ restaurantId: selected.id, outletId: outlet.id }),
+      });
+
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result?.error || 'Failed to delete outlet');
+      }
+
+      toast.success(`Outlet "${outlet.name}" deactivated`);
+      await loadOutlets(selected.id);
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to delete outlet');
+    } finally {
+      setDeletingOutletId(null);
+    }
+  };
+
   const logAudit = async (action: string, entity: string, details: string) => {
     try {
       await supabase.from('audit_logs').insert({
@@ -313,45 +393,16 @@ export default function SuperadminClient() {
     setAddError('');
     setAddLoading(true);
     try {
-      const slug = addData.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') + '-' + Date.now();
-      const { data: rest, error: err } = await supabase
-        .from('restaurants')
-        .insert({
-          name: addData.name,
-          slug,
-          phone: addData.phone || null,
-          cuisine_type: addData.cuisineType || null,
-          gstin: addData.gstin || null,
-          fssai: addData.fssai || null,
-          website: addData.website || null,
-          address: addData.address || null,
-          city: addData.city || null,
-          state: addData.state || null,
-          pincode: addData.pincode || null,
-          seating_capacity: addData.seatingCapacity ? parseInt(addData.seatingCapacity) : null,
-          plan: addData.plan,
-          is_active: true,
-          onboarding_status: addData.onboardingStatus,
-        })
-        .select()
-        .single();
-      if (err) throw err;
-
-      // Create default outlet
-      await supabase.from('outlets').insert({
-        restaurant_id: rest.id,
-        name: addData.outletName || 'Main Branch',
-        slug: 'main',
-        address: addData.outletAddress || addData.address || addData.city || null,
-        phone: addData.outletPhone || addData.phone || null,
-        is_active: true,
+      const response = await fetch('/api/superadmin/restaurants', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(addData),
       });
 
-      await logAudit(
-        'restaurant_created',
-        'restaurant',
-        `New restaurant "${addData.name}" (id: ${rest.id}) created with plan "${addData.plan}" by superadmin`
-      );
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result?.error || 'Failed to create restaurant');
+      }
 
       setShowAdd(false);
       setAddData({
@@ -484,6 +535,72 @@ export default function SuperadminClient() {
           </div>
           <div>
             <h1 className="text-base font-bold text-foreground">Superadmin Panel</h1>
+          {/* Edit Outlet Modal */}
+          {showOutletEdit && editingOutlet && selected && (
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+              <div className="bg-card border border-border rounded-2xl w-full max-w-md shadow-2xl">
+                <div className="flex items-center justify-between px-6 py-4 border-b border-border">
+                  <div>
+                    <h3 className="text-base font-bold text-foreground">Edit Outlet</h3>
+                    <p className="text-xs text-muted-foreground mt-0.5">{editingOutlet.name}</p>
+                  </div>
+                  <button onClick={() => { setShowOutletEdit(false); setEditingOutlet(null); }} className="p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors">
+                    <X size={16} />
+                  </button>
+                </div>
+
+                <div className="p-6 space-y-4">
+                  <div>
+                    <label className="block text-xs font-medium text-muted-foreground mb-1.5">Outlet Name *</label>
+                    <input
+                      value={outletForm.name}
+                      onChange={(e) => setOutletForm((s) => ({ ...s, name: e.target.value }))}
+                      className="w-full px-3 py-2.5 rounded-lg bg-secondary border border-border text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/40 focus:border-primary transition-colors"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-muted-foreground mb-1.5">Address</label>
+                    <textarea
+                      value={outletForm.address}
+                      onChange={(e) => setOutletForm((s) => ({ ...s, address: e.target.value }))}
+                      rows={3}
+                      className="w-full px-3 py-2.5 rounded-lg bg-secondary border border-border text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/40 focus:border-primary transition-colors resize-none"
+                    />
+                  </div>
+                  <div className="flex items-center justify-between rounded-xl border border-border bg-secondary px-3 py-2.5">
+                    <div>
+                      <p className="text-xs font-semibold text-foreground">Active</p>
+                      <p className="text-[11px] text-muted-foreground">Inactive outlets are hidden from staff views</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setOutletForm((s) => ({ ...s, is_active: !s.is_active }))}
+                      className={`relative w-11 h-6 rounded-full transition-colors ${outletForm.is_active ? 'bg-green-500' : 'bg-secondary border border-border'}`}
+                    >
+                      <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all ${outletForm.is_active ? 'left-5' : 'left-0.5'}`} />
+                    </button>
+                  </div>
+                  <div className="flex gap-2 pt-1">
+                    <button
+                      onClick={() => { setShowOutletEdit(false); setEditingOutlet(null); }}
+                      className="flex-1 py-2.5 bg-secondary border border-border rounded-xl text-sm font-semibold text-foreground hover:bg-secondary/80 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={saveOutlet}
+                      disabled={savingOutlet}
+                      className="flex-1 py-2.5 bg-primary text-primary-foreground rounded-xl text-sm font-semibold hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2"
+                    >
+                      {savingOutlet ? <Loader2 size={14} className="animate-spin" /> : <Pencil size={14} />}
+                      {savingOutlet ? 'Saving…' : 'Save Changes'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
             <p className="text-xs text-muted-foreground">RestroOS Platform Management</p>
           </div>
         </div>
@@ -864,13 +981,36 @@ export default function SuperadminClient() {
                       ) : (
                         <div className="space-y-1.5">
                           {outlets.map((o) => (
-                            <div key={o.id} className="flex items-center gap-2 px-3 py-2 rounded-lg bg-secondary">
-                              <MapPin size={11} className="text-accent flex-shrink-0" />
+                            <div key={o.id} className="flex items-start gap-2 px-3 py-2 rounded-lg bg-secondary">
+                              <MapPin size={11} className="text-accent flex-shrink-0 mt-1" />
                               <div className="min-w-0 flex-1">
-                                <p className="text-xs font-medium text-foreground truncate">{o.name}</p>
-                                {o.address && <p className="text-[10px] text-muted-foreground truncate">{o.address}</p>}
+                                <div className="flex items-start justify-between gap-2">
+                                  <div className="min-w-0">
+                                    <p className="text-xs font-medium text-foreground truncate">{o.name}</p>
+                                    {o.address && <p className="text-[10px] text-muted-foreground truncate">{o.address}</p>}
+                                  </div>
+                                  <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 mt-1 ${o.is_active ? 'bg-green-400' : 'bg-red-400'}`} />
+                                </div>
+                                <div className="flex items-center gap-1.5 mt-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => openEditOutlet(o)}
+                                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-border bg-card text-[10px] font-semibold text-muted-foreground hover:text-foreground hover:border-primary/40 transition-colors"
+                                  >
+                                    <Pencil size={10} />
+                                    Edit
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => softDeleteOutlet(o)}
+                                    disabled={deletingOutletId === o.id}
+                                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-border bg-card text-[10px] font-semibold text-muted-foreground hover:text-red-400 hover:border-red-500/30 transition-colors disabled:opacity-50"
+                                  >
+                                    {deletingOutletId === o.id ? <Loader2 size={10} className="animate-spin" /> : <Trash2 size={10} />}
+                                    Delete
+                                  </button>
+                                </div>
                               </div>
-                              <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${o.is_active ? 'bg-green-400' : 'bg-red-400'}`} />
                             </div>
                           ))}
                         </div>
@@ -920,6 +1060,7 @@ export default function SuperadminClient() {
                         value={addData.phone}
                         onChange={(e) => setAddData((d) => ({ ...d, phone: e.target.value }))}
                         placeholder="+91 98765 43210"
+                        required
                         className="w-full px-3 py-2.5 rounded-lg bg-secondary border border-border text-foreground text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/40 focus:border-primary transition-colors"
                       />
                     </div>
@@ -980,6 +1121,7 @@ export default function SuperadminClient() {
                       value={addData.ownerName}
                       onChange={(e) => setAddData((d) => ({ ...d, ownerName: e.target.value }))}
                       placeholder="Rahul Sharma"
+                      required
                       className="w-full px-3 py-2.5 rounded-lg bg-secondary border border-border text-foreground text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/40 focus:border-primary transition-colors"
                     />
                   </div>
@@ -990,6 +1132,7 @@ export default function SuperadminClient() {
                       value={addData.ownerEmail}
                       onChange={(e) => setAddData((d) => ({ ...d, ownerEmail: e.target.value }))}
                       placeholder="owner@restaurant.com"
+                      required
                       className="w-full px-3 py-2.5 rounded-lg bg-secondary border border-border text-foreground text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/40 focus:border-primary transition-colors"
                     />
                   </div>
